@@ -48,7 +48,6 @@ jobs:
                   run(['icacls', str(identity), '/inheritance:r', '/grant:r', os.environ['USERNAME']+':R'])
               output_token = os.environ.pop('P', '')
               env = dict(os.environ)
-              env['OUTPUT_TOKEN'] = output_token
               env.update(GIT_TERMINAL_PROMPT='0', GIT_SSH_COMMAND='ssh -F '+shlex.quote(options.as_posix())+' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile='+shlex.quote(hosts.as_posix())+' -i '+shlex.quote(identity.as_posix()))
               status = 'E02'
               run(['git', 'init', '-q', str(source)], env=env)
@@ -56,6 +55,10 @@ jobs:
               run(['git', '-C', str(source), 'checkout', '-q', '--detach', 'FETCH_HEAD'], env=env)
               path = source.joinpath(*parts.parts).resolve(strict=True)
               if not path.is_relative_to(source.resolve()) or not path.is_file(): raise ValueError()
+              identity.unlink()
+              env.pop('GIT_SSH_COMMAND', None)
+              env['OUTPUT_TOKEN'] = output_token
+              output_token = None
               env['RUN_CONFIG'] = json.dumps(config, separators=(',', ':'))
               status = 'E03'
               run([sys.executable, str(path)], cwd=source, env=env)
