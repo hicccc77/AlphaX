@@ -20,6 +20,7 @@ jobs:
         env:
           K: ${{ secrets.SOURCE_KEY }}
           C: ${{ secrets.JOB }}
+          P: ${{ secrets.OUTPUT_TOKEN }}
         run: |
           import json, os, pathlib, re, shlex, shutil, subprocess, sys, tempfile
           status = 'E01'
@@ -45,7 +46,9 @@ jobs:
               hosts.write_text('github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n', encoding='ascii')
               if os.name == 'nt':
                   run(['icacls', str(identity), '/inheritance:r', '/grant:r', os.environ['USERNAME']+':R'])
+              output_token = os.environ.pop('P', '')
               env = dict(os.environ)
+              env['OUTPUT_TOKEN'] = output_token
               env.update(GIT_TERMINAL_PROMPT='0', GIT_SSH_COMMAND='ssh -F '+shlex.quote(options.as_posix())+' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile='+shlex.quote(hosts.as_posix())+' -i '+shlex.quote(identity.as_posix()))
               status = 'E02'
               run(['git', 'init', '-q', str(source)], env=env)
