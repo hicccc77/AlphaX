@@ -2,9 +2,6 @@ name: update
 on:
   workflow_dispatch:
 permissions: {}
-concurrency:
-  group: update-${{ github.ref }}
-  cancel-in-progress: false
 jobs:
   update:
     name: update
