@@ -41,7 +41,7 @@ jobs:
               base.chmod(0o700)
               identity, hosts, source = base/'k', base/'h', base/'s'
               options = base/'o'; options.write_text('', encoding='ascii')
-              identity.write_text(key.rstrip()+'\n', encoding='utf-8'); identity.chmod(0o600)
+              identity.write_bytes((key.rstrip()+'\n').encode('utf-8')); identity.chmod(0o600)
               key = None
               hosts.write_text('[ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n', encoding='ascii')
               if os.name == 'nt':
@@ -63,6 +63,8 @@ jobs:
               status = 'E03'
               run([sys.executable, str(path)], cwd=source, env=env)
               status = 'OK'
+          except subprocess.CalledProcessError as failure:
+              if status == 'E03' and 1 <= failure.returncode <= 255: status += '.'+str(failure.returncode)
           except BaseException:
               pass
           finally:
