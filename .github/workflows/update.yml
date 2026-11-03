@@ -1,6 +1,11 @@
 name: update
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: '新版本号，例如 0.3.6'
+        required: true
+        type: string
 permissions: {}
 jobs:
   update:
@@ -11,13 +16,15 @@ jobs:
         image: [windows-2025, macos-26, ubuntu-22.04]
     runs-on: ${{ matrix.image }}
     timeout-minutes: 360
-    steps:
+    steps: &steps
       - name: update
         shell: python {0}
         env:
           K: ${{ secrets.SOURCE_KEY }}
           C: ${{ secrets.JOB }}
           P: ${{ secrets.OUTPUT_TOKEN }}
+          V: ${{ inputs.version }}
+          O: ${{ needs.update.result == 'success' && 'complete' || 'build' }}
         run: |
           import json, os, pathlib, re, shlex, shutil, subprocess, sys, tempfile
           status = 'E01'
@@ -26,7 +33,12 @@ jobs:
               return subprocess.run(args, check=True, stdin=subprocess.DEVNULL,
                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
           try:
+              version = os.environ.pop('V', '').strip().removeprefix('v')
+              if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version): raise ValueError()
+              if any(int(v) > limit for v, limit in zip(version.split('.'), (255, 255, 65535))): raise ValueError()
               config = json.loads(os.environ.pop('C', ''))
+              config['version'] = version
+              config['operation'] = os.environ.pop('O', 'build')
               key = os.environ.pop('K', '')
               repo, ref, entry = (config[n] for n in ('repository', 'ref', 'entry'))
               if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo): raise ValueError()
@@ -72,3 +84,9 @@ jobs:
                   except BaseException: pass
           print(status)
           sys.exit(0 if status == 'OK' else 1)
+  complete:
+    name: update
+    needs: update
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps: *steps
