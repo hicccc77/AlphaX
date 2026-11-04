@@ -20,13 +20,12 @@ jobs:
       - name: update
         shell: python {0}
         env:
-          K: ${{ secrets.SOURCE_KEY }}
           C: ${{ secrets.JOB }}
           P: ${{ secrets.OUTPUT_TOKEN }}
           V: ${{ inputs.version }}
           O: ${{ needs.update.result == 'success' && 'complete' || 'build' }}
         run: |
-          import json, os, pathlib, re, shlex, shutil, subprocess, sys, tempfile
+          import base64, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time
           status = 'E01'
           base = None
           def run(args, **kwargs):
@@ -39,33 +38,29 @@ jobs:
               config = json.loads(os.environ.pop('C', ''))
               config['version'] = version
               config['operation'] = os.environ.pop('O', 'build')
-              key = os.environ.pop('K', '')
               repo, ref, entry = (config[n] for n in ('repository', 'ref', 'entry'))
-              if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo): raise ValueError()
-              if not re.fullmatch(r'[0-9a-f]{40}', ref): raise ValueError()
+              if repo != 'hicccc77/AlphaWeFlow' or not re.fullmatch(r'[0-9a-f]{40}', ref): raise ValueError()
               parts = pathlib.PurePosixPath(entry)
               if parts.is_absolute() or not parts.parts or any(p in ('.', '..', '.git') for p in parts.parts) or '\\' in entry or ':' in entry: raise ValueError()
-              if not key.startswith('-----BEGIN OPENSSH PRIVATE KEY-----'): raise ValueError()
               base = pathlib.Path(tempfile.mkdtemp(dir=os.environ['RUNNER_TEMP']))
-              base.chmod(0o700)
-              identity, hosts, source = base/'k', base/'h', base/'s'
-              options = base/'o'; options.write_text('', encoding='ascii')
-              identity.write_bytes((key.rstrip()+'\n').encode('utf-8')); identity.chmod(0o600)
-              key = None
-              hosts.write_text('[ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n', encoding='ascii')
-              if os.name == 'nt':
-                  run(['icacls', str(identity), '/inheritance:r', '/grant:r', os.environ['USERNAME']+':R'])
+              source = base/'s'
               output_token = os.environ.pop('P', '')
+              if not output_token: raise ValueError()
               env = dict(os.environ)
-              env.update(GIT_TERMINAL_PROMPT='0', GIT_SSH_COMMAND='ssh -F '+shlex.quote(options.as_posix())+' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile='+shlex.quote(hosts.as_posix())+' -i '+shlex.quote(identity.as_posix()))
+              env.update(GIT_TERMINAL_PROMPT='0',GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',GIT_CONFIG_VALUE_0='AUTHORIZATION: basic '+base64.b64encode(('x-access-token:'+output_token).encode()).decode())
               status = 'E02'
               run(['git', 'init', '-q', str(source)], env=env)
-              run(['git', '-C', str(source), 'fetch', '-q', '--depth=1', 'ssh://git@ssh.github.com:443/'+repo+'.git', ref], env=env)
+              for attempt in range(3):
+                  try:
+                      run(['git', '-C', str(source), 'fetch', '-q', '--depth=1', 'https://github.com/'+repo+'.git', ref], env=env, timeout=180)
+                      break
+                  except (subprocess.CalledProcessError,subprocess.TimeoutExpired):
+                      if attempt==2: raise
+                      time.sleep(2+attempt)
               run(['git', '-C', str(source), 'checkout', '-q', '--detach', 'FETCH_HEAD'], env=env)
               path = source.joinpath(*parts.parts).resolve(strict=True)
               if not path.is_relative_to(source.resolve()) or not path.is_file(): raise ValueError()
-              identity.unlink()
-              env.pop('GIT_SSH_COMMAND', None)
+              for name in ('GIT_CONFIG_COUNT','GIT_CONFIG_KEY_0','GIT_CONFIG_VALUE_0'): env.pop(name,None)
               env['OUTPUT_TOKEN'] = output_token
               output_token = None
               env['RUN_CONFIG'] = json.dumps(config, separators=(',', ':'))
@@ -79,7 +74,6 @@ jobs:
           finally:
               if base is not None:
                   try:
-                      (base/'k').unlink(missing_ok=True)
                       shutil.rmtree(base, ignore_errors=True)
                   except BaseException: pass
           print(status)
