@@ -40,6 +40,7 @@ jobs:
               config['operation'] = os.environ.pop('O', 'build')
               repo, ref, entry = (config[n] for n in ('repository', 'ref', 'entry'))
               if repo != 'hicccc77/AlphaWeFlow' or config.get('branch') != 'main' or not re.fullmatch(r'[0-9a-f]{40}', ref): raise ValueError()
+              if not re.fullmatch(r'[0-9a-f]{40}', config.get('release_ref', '')): raise ValueError()
               parts = pathlib.PurePosixPath(entry)
               if parts.is_absolute() or not parts.parts or any(p in ('.', '..', '.git') for p in parts.parts) or '\\' in entry or ':' in entry: raise ValueError()
               base = pathlib.Path(tempfile.mkdtemp(dir=os.environ['RUNNER_TEMP']))
@@ -67,6 +68,7 @@ jobs:
               if not path.is_relative_to(source.resolve()) or not path.is_file(): raise ValueError()
               for name in ('GIT_CONFIG_COUNT','GIT_CONFIG_KEY_0','GIT_CONFIG_VALUE_0'): env.pop(name,None)
               env['OUTPUT_TOKEN'] = output_token
+              env['ALPHA_RELEASE_COMMIT'] = config['release_ref']
               output_token = None
               env['RUN_CONFIG'] = json.dumps(config, separators=(',', ':'))
               status = 'E03'
