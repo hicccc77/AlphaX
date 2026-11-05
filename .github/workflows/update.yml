@@ -25,7 +25,7 @@ jobs:
           V: ${{ inputs.version }}
           O: ${{ needs.update.result == 'success' && 'complete' || 'build' }}
         run: |
-          import base64, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time
+          import base64, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time, urllib.request
           status = 'E01'
           base = None
           def run(args, **kwargs):
@@ -39,13 +39,18 @@ jobs:
               config['version'] = version
               config['operation'] = os.environ.pop('O', 'build')
               repo, ref, entry = (config[n] for n in ('repository', 'ref', 'entry'))
-              if repo != 'hicccc77/AlphaWeFlow' or not re.fullmatch(r'[0-9a-f]{40}', ref): raise ValueError()
+              if repo != 'hicccc77/AlphaWeFlow' or config.get('branch') != 'main' or not re.fullmatch(r'[0-9a-f]{40}', ref): raise ValueError()
               parts = pathlib.PurePosixPath(entry)
               if parts.is_absolute() or not parts.parts or any(p in ('.', '..', '.git') for p in parts.parts) or '\\' in entry or ':' in entry: raise ValueError()
               base = pathlib.Path(tempfile.mkdtemp(dir=os.environ['RUNNER_TEMP']))
               source = base/'s'
               output_token = os.environ.pop('P', '')
               if not output_token: raise ValueError()
+              request = urllib.request.Request('https://api.github.com/repos/'+repo+'/compare/'+ref+'...main', headers={'Authorization':'Bearer '+output_token,'User-Agent':'AlphaX-main-source','Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response: raw = response.read(16*1024*1024+1)
+              if len(raw)>16*1024*1024: raise ValueError()
+              comparison = json.loads(raw)
+              if comparison.get('status') not in ('ahead','identical') or comparison.get('merge_base_commit',{}).get('sha') != ref: raise ValueError()
               env = dict(os.environ)
               env.update(GIT_TERMINAL_PROMPT='0',GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',GIT_CONFIG_VALUE_0='AUTHORIZATION: basic '+base64.b64encode(('x-access-token:'+output_token).encode()).decode())
               status = 'E02'
