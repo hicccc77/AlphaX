@@ -1,0 +1,60 @@
+name: 错误报告
+description: 报告 Alpha 使用中遇到的错误，必须提供详细描述和日志文件。
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先搜索已有 Issue，避免重复报告。
+        请从 Alpha 的“日志与反馈”区域导出日志，在下方上传。此仓库公开可见，提交前请检查日志并移除个人隐私、密钥和授权文件内容。
+  - type: input
+    id: version
+    attributes:
+      label: Alpha 版本
+      placeholder: 例如 1.3.3
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 系统与运行环境
+      description: 请填写操作系统版本、芯片架构及与问题有关的环境信息。
+      placeholder: 例如 Windows 11 x64 / macOS 15 Apple Silicon / Ubuntu 24.04 x64
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 详细描述
+      description: 至少 30 字。请说明使用的功能、实际发生的情况、预期结果及影响范围。
+      placeholder: 请详细描述问题，而不是只填写“不能用”或“报错了”。
+    validations:
+      required: true
+      min_length: 30
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请按顺序说明触发问题的操作；偶发问题请说明频率和出现前的操作。
+      placeholder: |
+        1. 打开……
+        2. 点击……
+        3. 出现……
+    validations:
+      required: true
+  - type: upload
+    id: logs
+    attributes:
+      label: 上传日志
+      description: 必须上传从 Alpha 导出的日志文件；可上传 JSON、LOG、TXT 或 ZIP 格式，不要上传授权文件或密钥。
+    validations:
+      required: true
+      accept: ".json,.log,.txt,.zip"
+  - type: upload
+    id: screenshots
+    attributes:
+      label: 截图或录屏（可选）
+      description: 可补充已遮挡个人信息的截图或录屏。
+    validations:
+      required: false
+      accept: ".png,.jpg,.jpeg,.gif,.webp,.mp4,.mov,.webm"

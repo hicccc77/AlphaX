@@ -1,0 +1,23 @@
+name: 新功能
+description: 提出 Alpha 目前尚未提供的新功能。
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: 请先搜索已有 Issue，确认该功能尚未提出；现有功能的改进请使用“现有优化”。
+  - type: textarea
+    id: description
+    attributes:
+      label: 详细描述
+      description: 至少 30 字。请说明使用场景、遇到的需求、希望新增的能力以及预期效果。
+      placeholder: 请结合具体使用场景，说明希望增加什么功能、为什么需要它。
+    validations:
+      required: true
+      min_length: 30
+  - type: textarea
+    id: references
+    attributes:
+      label: 补充材料（可选）
+      description: 可提供参考链接、示意图或其他有助于理解需求的材料。
+    validations:
+      required: false
