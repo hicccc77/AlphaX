@@ -1,0 +1,650 @@
+name: Private task transport
+run-name: Private task transport
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Opaque configuration key
+        required: true
+        type: string
+permissions: {}
+jobs:
+  transport:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    steps:
+      - name: Channel
+        shell: pwsh
+        env:
+          C: ${{ secrets[inputs.channel] }}
+          P: ${{ secrets.OUTPUT_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $status = 1
+          $program = @'
+          """Public generic controller. No task identity, private source or credentials here."""
+          import base64
+          import ctypes as ct
+          from ctypes import wintypes as wt
+          import hashlib
+          import json
+          import msvcrt
+          import os
+          from pathlib import Path
+          import re
+          import secrets
+          import subprocess
+          import sys
+          import threading
+          import time
+          import traceback
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          
+          
+          CONTROLLER_SECONDS = 340 * 60
+          STARTUP_SECONDS = 10 * 60
+          FINALIZATION_SECONDS = 30 * 60
+          LOG_RECEIPT_RESERVE_SECONDS = 5 * 60
+          CLEANUP_RECEIPT_RESERVE_SECONDS = 3 * 60
+          
+          
+          def check_deadline(deadline):
+              remaining = deadline - time.monotonic()
+              if remaining <= 0:
+                  raise RuntimeError("CHANNEL_DEADLINE_EXCEEDED")
+              return remaining
+          
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise RuntimeError("API_REDIRECT_REFUSED")
+          
+          
+          def canonical(value):
+              return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+          
+          
+          def digest(data):
+              return hashlib.sha256(data).hexdigest()
+          
+          
+          def file_digest(path, deadline):
+              value = hashlib.sha256()
+              with path.open("rb") as stream:
+                  while data := stream.read(256 * 1024):
+                      check_deadline(deadline)
+                      value.update(data)
+              return value.hexdigest()
+          
+          
+          class Channel:
+              def __init__(self, config, token, deadline):
+                  self.c = config
+                  self.token = token
+                  self.opener = urllib.request.build_opener(NoRedirect())
+                  self.last_write = 0.0
+                  self.deadline = deadline
+                  self.request_timed_out = False
+          
+              def api(self, method, path, data=None):
+                  # A daemon worker also bounds DNS/slow-drip waits, not just socket inactivity.
+                  request_deadline = time.monotonic() + min(45.0, check_deadline(self.deadline))
+                  finished = threading.Event()
+                  outcome = []
+                  def request():
+                      try:
+                          outcome.append((True, self.api_sync(method, path, data, request_deadline)))
+                      except BaseException as error:
+                          outcome.append((False, error))
+                      finally:
+                          finished.set()
+                  threading.Thread(target=request, daemon=True).start()
+                  if not finished.wait(max(0.0, request_deadline - time.monotonic())):
+                      self.request_timed_out = True
+                      raise RuntimeError("API_REQUEST_DEADLINE_EXCEEDED")
+                  check_deadline(request_deadline)
+                  success, value = outcome[0]
+                  if not success:
+                      raise value
+                  return value
+          
+              def api_sync(self, method, path, data, deadline):
+                  if not path.startswith("/repos/") or ".." in path:
+                      raise RuntimeError("API_PATH_REFUSED")
+                  req = urllib.request.Request(
+                      "https://api.github.com" + path,
+                      data=None if data is None else canonical(data),
+                      headers={"Authorization": "Bearer " + self.token,
+                               "Accept": "application/vnd.github+json",
+                               "X-GitHub-Api-Version": "2022-11-28",
+                               "User-Agent": "private-task-channel-v1",
+                               "Content-Type": "application/json"}, method=method)
+                  try:
+                      with self.opener.open(req, timeout=min(45.0, check_deadline(deadline))) as response:
+                          if response.geturl() != "https://api.github.com" + path:
+                              raise RuntimeError("API_ORIGIN_CHANGED")
+                          chunks = []
+                          while True:
+                              check_deadline(deadline)
+                              chunk = response.read1(64 * 1024)
+                              if not chunk:
+                                  break
+                              chunks.append(chunk)
+                          check_deadline(deadline)
+                          return json.loads(b"".join(chunks))
+                  except urllib.error.HTTPError as error:
+                      # Bodies/headers are never interpolated into a public exception.
+                      raise RuntimeError("API_HTTP_" + str(error.code)) from None
+          
+              def private(self):
+                  metadata = self.api("GET", "/repos/" + self.c["output_repo"])
+                  if (metadata.get("private") is not True or
+                          metadata.get("id") != self.c["output_repo_id"] or
+                          metadata.get("full_name", "").lower() != self.c["output_repo"].lower()):
+                      raise RuntimeError("PRIVATE_REPOSITORY_IDENTITY_REFUSED")
+          
+              def get_file(self, path, ref):
+                  query = urllib.parse.urlencode({"ref": ref})
+                  return self.api("GET", "/repos/" + self.c["output_repo"] + "/contents/" +
+                                  urllib.parse.quote(path, safe="/") + "?" + query)
+          
+              @staticmethod
+              def content(value):
+                  if value.get("type") != "file" or value.get("encoding") != "base64":
+                      raise RuntimeError("CONTENT_ENCODING_REFUSED")
+                  return base64.b64decode(value["content"], validate=False)
+          
+              def put_verified(self, path, data):
+                  # Fewer than 80 content-producing requests/minute; all chunks bounded in RAM.
+                  delay = max(0.0, 1.05 - (time.monotonic() - self.last_write))
+                  if delay >= check_deadline(self.deadline):
+                      raise RuntimeError("CHANNEL_DEADLINE_EXCEEDED")
+                  time.sleep(delay)
+                  self.private()
+                  result = self.api("PUT", "/repos/" + self.c["output_repo"] + "/contents/" +
+                                    urllib.parse.quote(path, safe="/"),
+                                    {"message": "private channel record",
+                                     "branch": self.c["output_branch"],
+                                     "content": base64.b64encode(data).decode("ascii")})
+                  self.last_write = time.monotonic()
+                  read = self.get_file(path, self.c["output_branch"])
+                  if self.content(read) != data or read.get("sha") != result["content"]["sha"]:
+                      raise RuntimeError("PRIVATE_WRITE_READ_MISMATCH")
+                  return {"path": path, "sha256": digest(data), "bytes": len(data),
+                          "blob_sha": read["sha"]}
+          
+          
+          def checked_config(encoded):
+              raw = base64.b64decode(encoded, validate=True)
+              if len(raw) > 35000:
+                  raise RuntimeError("CONFIG_SIZE_REFUSED")
+              c = json.loads(raw)
+              required = {"version", "output_repo", "output_repo_id", "output_branch",
+                          "source_ref", "entry_commit", "entry_path", "entry_sha",
+                          "entry_sha256", "context_nonce", "timeout_seconds", "args", "task_env"}
+              if set(c) != required or c["version"] != 1:
+                  raise RuntimeError("CONFIG_SCHEMA_REFUSED")
+              if (type(c["output_repo"]) is not str or
+                      not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}", c["output_repo"]) or
+                      c["output_repo"].split("/")[1] in (".", "..")):
+                  raise RuntimeError("OUTPUT_REPOSITORY_REFUSED")
+              if type(c["output_repo_id"]) is not int or c["output_repo_id"] <= 0:
+                  raise RuntimeError("OUTPUT_REPOSITORY_ID_REFUSED")
+              if not re.fullmatch(r"private-task-[0-9a-f]{24,64}", c["output_branch"]):
+                  raise RuntimeError("OUTPUT_BRANCH_REFUSED")
+              for key in ("source_ref", "entry_commit", "entry_sha"):
+                  if not re.fullmatch(r"[0-9a-f]{40}", c[key]):
+                      raise RuntimeError("FIXED_COMMIT_OR_BLOB_REFUSED")
+              # V1 is a complete one-file task, not a full-application source transport.
+              if c["source_ref"] != c["entry_commit"]:
+                  raise RuntimeError("SINGLE_FILE_SOURCE_BINDING_REFUSED")
+              for key in ("entry_sha256", "context_nonce"):
+                  if not re.fullmatch(r"[0-9a-f]{64}", c[key]):
+                      raise RuntimeError("CONFIG_DIGEST_REFUSED")
+              if not re.fullmatch(r"[A-Za-z0-9_/-]+\.py", c["entry_path"]) or any(
+                      p in ("", ".", "..") for p in c["entry_path"].split("/")):
+                  raise RuntimeError("ENTRY_PATH_REFUSED")
+              if type(c["timeout_seconds"]) is not int or not 1 <= c["timeout_seconds"] <= 18000:
+                  raise RuntimeError("TIMEOUT_REFUSED")
+              if (type(c["args"]) is not list or len(c["args"]) > 128 or
+                      any(type(x) is not str or "\x00" in x for x in c["args"])):
+                  raise RuntimeError("ENTRY_ARGUMENTS_REFUSED")
+              if type(c["task_env"]) is not dict:
+                  raise RuntimeError("TASK_ENV_REFUSED")
+              for key, value in c["task_env"].items():
+                  if (not re.fullmatch(r"TASK_[A-Z0-9_]{1,100}", key) or
+                          any(x in key for x in ("TOKEN", "PASSWORD", "CREDENTIAL")) or
+                          type(value) is not str or "\x00" in value):
+                      raise RuntimeError("TASK_ENV_REFUSED")
+              return c
+          
+          
+          class ProcessJob:
+              """Suspend -> assign kill-on-close Job Object -> resume; no child-spawn gap."""
+              def __init__(self):
+                  k = ct.WinDLL("kernel32", use_last_error=True)
+                  self.k = k
+                  self.job = self.process = self.thread = None
+                  self.created = self.assigned = self.resumed = False
+                  HANDLE = wt.HANDLE
+                  class IO(ct.Structure):
+                      _fields_ = [(n, ct.c_ulonglong) for n in
+                                  ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                                   "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+                  class Basic(ct.Structure):
+                      _fields_ = [("PerProcessUserTimeLimit", ct.c_longlong),
+                                  ("PerJobUserTimeLimit", ct.c_longlong), ("LimitFlags", wt.DWORD),
+                                  ("MinimumWorkingSetSize", ct.c_size_t),
+                                  ("MaximumWorkingSetSize", ct.c_size_t), ("ActiveProcessLimit", wt.DWORD),
+                                  ("Affinity", ct.c_size_t), ("PriorityClass", wt.DWORD),
+                                  ("SchedulingClass", wt.DWORD)]
+                  class Extended(ct.Structure):
+                      _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", IO),
+                                  ("ProcessMemoryLimit", ct.c_size_t), ("JobMemoryLimit", ct.c_size_t),
+                                  ("PeakProcessMemoryUsed", ct.c_size_t),
+                                  ("PeakJobMemoryUsed", ct.c_size_t)]
+                  class Startup(ct.Structure):
+                      _fields_ = [("cb", wt.DWORD), ("lpReserved", wt.LPWSTR),
+                                  ("lpDesktop", wt.LPWSTR), ("lpTitle", wt.LPWSTR),
+                                  ("dwX", wt.DWORD), ("dwY", wt.DWORD),
+                                  ("dwXSize", wt.DWORD), ("dwYSize", wt.DWORD),
+                                  ("dwXCountChars", wt.DWORD), ("dwYCountChars", wt.DWORD),
+                                  ("dwFillAttribute", wt.DWORD), ("dwFlags", wt.DWORD),
+                                  ("wShowWindow", wt.WORD), ("cbReserved2", wt.WORD),
+                                  ("lpReserved2", ct.POINTER(wt.BYTE)),
+                                  ("hStdInput", HANDLE), ("hStdOutput", HANDLE), ("hStdError", HANDLE)]
+                  class Information(ct.Structure):
+                      _fields_ = [("hProcess", HANDLE), ("hThread", HANDLE),
+                                  ("dwProcessId", wt.DWORD), ("dwThreadId", wt.DWORD)]
+                  class Accounting(ct.Structure):
+                      _fields_ = [(n, ct.c_longlong) for n in
+                                  ("TotalUserTime", "TotalKernelTime", "ThisPeriodTotalUserTime",
+                                   "ThisPeriodTotalKernelTime")] + [(n, wt.DWORD) for n in
+                                  ("TotalPageFaultCount", "TotalProcesses", "ActiveProcesses",
+                                   "TotalTerminatedProcesses")]
+                  self.Accounting = Accounting
+                  self.Extended, self.Information, self.Startup = Extended, Information, Startup
+                  signatures = {
+                      "CreateJobObjectW": ([ct.c_void_p, wt.LPCWSTR], HANDLE),
+                      "SetInformationJobObject": ([HANDLE, ct.c_int, ct.c_void_p, wt.DWORD], wt.BOOL),
+                      "QueryInformationJobObject": ([HANDLE, ct.c_int, ct.c_void_p, wt.DWORD, ct.c_void_p], wt.BOOL),
+                      "AssignProcessToJobObject": ([HANDLE, HANDLE], wt.BOOL),
+                      "TerminateJobObject": ([HANDLE, wt.UINT], wt.BOOL),
+                      "CloseHandle": ([HANDLE], wt.BOOL),
+                      "SetHandleInformation": ([HANDLE, wt.DWORD, wt.DWORD], wt.BOOL),
+                      "ResumeThread": ([HANDLE], wt.DWORD),
+                      "TerminateProcess": ([HANDLE, wt.UINT], wt.BOOL),
+                      "WaitForSingleObject": ([HANDLE, wt.DWORD], wt.DWORD),
+                      "GetExitCodeProcess": ([HANDLE, ct.POINTER(wt.DWORD)], wt.BOOL),
+                      "CreateProcessW": ([wt.LPCWSTR, wt.LPWSTR, ct.c_void_p, ct.c_void_p,
+                                          wt.BOOL, wt.DWORD, ct.c_void_p, wt.LPCWSTR,
+                                          ct.POINTER(Startup), ct.POINTER(Information)], wt.BOOL)}
+                  for name, (args, result) in signatures.items():
+                      function = getattr(k, name)
+                      function.argtypes, function.restype = args, result
+              def start(self, argv, cwd, env, stdin, stdout, stderr):
+                  k = self.k
+                  if self.job is not None or self.created:
+                      raise RuntimeError("CHILD_START_REUSE_REFUSED")
+                  self.job = k.CreateJobObjectW(None, None)
+                  if not self.job:
+                      raise RuntimeError("JOB_CREATE_FAILED")
+                  limits = self.Extended()
+                  limits.BasicLimitInformation.LimitFlags = 0x2000
+                  if not k.SetInformationJobObject(self.job, 9, ct.byref(limits), ct.sizeof(limits)):
+                      raise RuntimeError("JOB_LIMIT_FAILED")
+                  info, startup = self.Information(), self.Startup()
+                  startup.cb, startup.dwFlags = ct.sizeof(startup), 0x100
+                  handles = [msvcrt.get_osfhandle(f.fileno()) for f in (stdin, stdout, stderr)]
+                  startup.hStdInput, startup.hStdOutput, startup.hStdError = handles
+                  try:
+                      for handle in handles:
+                          if not k.SetHandleInformation(handle, 1, 1):
+                              raise RuntimeError("STD_HANDLE_INHERIT_FAILED")
+                      block = ct.create_unicode_buffer("\x00".join(
+                          key + "=" + value for key, value in sorted(env.items(), key=lambda x: x[0].upper())) + "\x00\x00")
+                      command = ct.create_unicode_buffer(subprocess.list2cmdline(argv))
+                      if not k.CreateProcessW(argv[0], command, None, None, True,
+                                              0x4 | 0x400 | 0x08000000, block, str(cwd),
+                                              ct.byref(startup), ct.byref(info)):
+                          raise RuntimeError("CHILD_CREATE_FAILED")
+                      self.process = info.hProcess
+                      self.thread = info.hThread
+                      self.created = True
+                      if not k.AssignProcessToJobObject(self.job, self.process):
+                          raise RuntimeError("CHILD_JOB_ASSIGN_FAILED")
+                      self.assigned = True
+                      resume_state = k.ResumeThread(self.thread)
+                      self.resumed = resume_state in (0, 1)
+                      if resume_state != 1:
+                          raise RuntimeError("CHILD_RESUME_FAILED")
+                  finally:
+                      for handle in handles:
+                          k.SetHandleInformation(handle, 1, 0)
+          
+              def active(self):
+                  value = self.Accounting()
+                  if not self.k.QueryInformationJobObject(self.job, 1, ct.byref(value), ct.sizeof(value), None):
+                      raise RuntimeError("JOB_QUERY_FAILED")
+                  return value.ActiveProcesses
+          
+              def quiescent(self):
+                  if not self.created:
+                      return True
+                  if self.process is None:
+                      raise RuntimeError("ROOT_PROCESS_HANDLE_UNAVAILABLE")
+                  state = self.k.WaitForSingleObject(self.process, 0)
+                  if state == 0xFFFFFFFF:
+                      raise RuntimeError("ROOT_PROCESS_WAIT_FAILED")
+                  if state != 0:
+                      return False
+                  if self.assigned:
+                      return self.active() == 0
+                  if self.resumed:
+                      raise RuntimeError("UNASSIGNED_RUNNING_CHILD_UNKNOWN")
+                  return True  # The unassigned root was created suspended and never resumed.
+          
+              def stop(self, exit_code=124):
+                  if not self.created or self.quiescent():
+                      return
+                  if self.assigned:
+                      terminated = self.k.TerminateJobObject(self.job, exit_code)
+                  elif not self.resumed:
+                      terminated = self.k.TerminateProcess(self.process, exit_code)
+                  else:
+                      raise RuntimeError("UNASSIGNED_RUNNING_CHILD_UNKNOWN")
+                  waited = self.k.WaitForSingleObject(self.process, 15000)
+                  if not terminated and waited != 0:
+                      raise RuntimeError("CHILD_TERMINATION_FAILED")
+                  if waited != 0:
+                      raise RuntimeError("CHILD_TERMINATION_WAIT_FAILED")
+                  deadline = time.monotonic() + 15
+                  while not self.quiescent() and time.monotonic() < deadline:
+                      time.sleep(0.1)
+                  if not self.quiescent():
+                      raise RuntimeError("JOB_NOT_QUIESCENT")
+          
+              def exit_code(self):
+                  value = wt.DWORD()
+                  if (self.k.WaitForSingleObject(self.process, 15000) != 0 or
+                          not self.k.GetExitCodeProcess(self.process, ct.byref(value))):
+                      raise RuntimeError("ROOT_EXIT_UNAVAILABLE")
+                  return value.value
+          
+              def close(self):
+                  if self.thread:
+                      self.k.CloseHandle(self.thread)
+                      self.thread = None
+                  if self.job:
+                      self.k.CloseHandle(self.job)
+                      self.job = None
+                  if self.process:
+                      self.k.CloseHandle(self.process)
+                      self.process = None
+          
+          
+          def clean_owned(root, expected, marker, deadline):
+              check_deadline(deadline)
+              if root != expected or root.parent != Path(os.environ["RUNNER_TEMP"]).resolve():
+                  raise RuntimeError("CLEANUP_ROOT_REFUSED")
+              if root.lstat().st_file_attributes & 0x400 or (root / ".owner").lstat().st_file_attributes & 0x400:
+                  raise RuntimeError("CLEANUP_OWNER_REPARSE_REFUSED")
+              if (root / ".owner").read_text(encoding="ascii") != marker:
+                  raise RuntimeError("CLEANUP_OWNER_REFUSED")
+              def remove(path):
+                  check_deadline(deadline)
+                  info = path.lstat()
+                  if info.st_file_attributes & 0x400:
+                      raise RuntimeError("CLEANUP_REPARSE_REFUSED")
+                  if path.is_dir():
+                      for child in path.iterdir():
+                          if path == root and child.name == ".owner":
+                              continue
+                          remove(child)
+                      if path == root:
+                          check_deadline(deadline)
+                          (root / ".owner").unlink()
+                      path.rmdir()
+                  else:
+                      path.unlink()
+              remove(root)
+          
+          
+          def clean_startup_root(root, marker_created, deadline):
+              """No recursive deletion when owner-marker initialization did not complete."""
+              check_deadline(deadline)
+              if root.parent != Path(os.environ["RUNNER_TEMP"]).resolve() or root.lstat().st_file_attributes & 0x400:
+                  raise RuntimeError("STARTUP_CLEANUP_ROOT_REFUSED")
+              if marker_created:
+                  marker = root / ".owner"
+                  if marker.lstat().st_file_attributes & 0x400:
+                      raise RuntimeError("STARTUP_CLEANUP_OWNER_REPARSE_REFUSED")
+                  marker.unlink()
+              root.rmdir()  # Refuses any unexpected entry; only our empty fresh root is removed.
+          
+          
+          def main():
+              controller_started = time.monotonic()
+              controller_deadline = controller_started + CONTROLLER_SECONDS
+              config_text = os.environ.pop("C", "")
+              token = os.environ.pop("P", "")
+              c = checked_config(config_text)
+              if not token:
+                  raise RuntimeError("OUTPUT_TOKEN_UNAVAILABLE")
+              channel = Channel(c, token, controller_started + STARTUP_SECONDS)
+              run = os.environ["GITHUB_RUN_ID"]
+              attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+              if not re.fullmatch(r"[0-9]+", run) or not re.fullmatch(r"[0-9]+", attempt):
+                  raise RuntimeError("RUN_ID_REFUSED")
+              prefix = "channels/" + c["context_nonce"] + "/runs/" + run + "-" + attempt
+              binding = {k: c[k] for k in ("source_ref", "entry_commit", "entry_path", "entry_sha",
+                                          "entry_sha256", "context_nonce", "output_repo_id")}
+              binding.update({"version": 1, "run_id": run, "run_attempt": attempt})
+              root = None
+              root_created = marker_created = marker_ready = False
+              marker = secrets.token_hex(32)
+              streams = {name: {"offset": 0, "parts": [], "capture_bytes": 0, "sha256": None}
+                         for name in ("stdout", "stderr")}
+              job = None
+              watchdog = None
+              watchdog_done = threading.Event()
+              watchdog_errors = []
+              launch_deadline = None
+              result = dict(binding, transport_complete=False, launched=False, timed_out=False,
+                            process_created=False, job_assignment_confirmed=False,
+                            root_exit_code=None, process_tree_quiescent=True, cleanup_complete=False,
+                            streams=streams, task_timeout_seconds=c["timeout_seconds"],
+                            controller_budget_seconds=CONTROLLER_SECONDS,
+                            finalization_budget_seconds=FINALIZATION_SECONDS)
+              original_error = None
+          
+              def remember_error(message):
+                  nonlocal original_error
+                  original_error = message if original_error is None else original_error + "\n" + message
+          
+              def flush(final):
+                  if root is None or not marker_ready:
+                      return
+                  for name, state in streams.items():
+                      path = root / (name + ".bin")
+                      if not path.exists():
+                          continue
+                      with path.open("rb") as stream:
+                          stream.seek(state["offset"])
+                          parts_this_tick = 0
+                          while True:
+                              check_deadline(channel.deadline)
+                              data = stream.read(256 * 1024)
+                              if not data:
+                                  break
+                              index = len(state["parts"])
+                              receipt = channel.put_verified(prefix + "/logs/" + name + "/" +
+                                                             str(index).zfill(10) + ".bin", data)
+                              state["parts"].append(receipt)
+                              state["offset"] += len(data)
+                              parts_this_tick += 1
+                              if not final and parts_this_tick >= 2:
+                                  break
+          
+              try:
+                  # Private output must round-trip before any private entry download/execution.
+                  channel.put_verified(prefix + "/sentinel.json", canonical(binding))
+                  root = Path(os.environ["RUNNER_TEMP"]).resolve() / ("private-task-" + secrets.token_hex(16))
+                  root.mkdir()
+                  root_created = True
+                  with (root / ".owner").open("x", encoding="ascii") as owner:
+                      marker_created = True
+                      owner.write(marker)
+                  marker_ready = True
+                  channel.private()
+                  content = channel.get_file(c["entry_path"], c["entry_commit"])
+                  entry = channel.content(content)
+                  if (content.get("sha") != c["entry_sha"] or digest(entry) != c["entry_sha256"] or
+                          hashlib.sha1(b"blob " + str(len(entry)).encode() + b"\x00" + entry).hexdigest() != c["entry_sha"]):
+                      raise RuntimeError("PINNED_ENTRY_BYTES_REFUSED")
+                  (root / "entry.py").write_bytes(entry)
+                  env = {key: value for key, value in os.environ.items() if key.upper() in {
+                      "SYSTEMROOT", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "NUMBER_OF_PROCESSORS",
+                      "PROCESSOR_ARCHITECTURE", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"}}
+                  env.update(c["task_env"])
+                  env.update({"TEMP": str(root), "TMP": str(root), "PYTHONDONTWRITEBYTECODE": "1",
+                              "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1",
+                              "TASK_CONTEXT_NONCE": c["context_nonce"],
+                              "TASK_SOURCE_REF": c["source_ref"]})
+                  for name in streams:
+                      (root / (name + ".bin")).touch()
+                  with open(os.devnull, "rb") as stdin, (root / "stdout.bin").open("ab", buffering=0) as stdout, \
+                          (root / "stderr.bin").open("ab", buffering=0) as stderr:
+                      # The outer owner retains every handle/state even if start fails halfway.
+                      job = ProcessJob()
+                      launch_started = time.monotonic()
+                      launch_deadline = launch_started + c["timeout_seconds"]
+                      if launch_deadline > controller_deadline - FINALIZATION_SECONDS:
+                          raise RuntimeError("INSUFFICIENT_PLATFORM_RUNTIME_WINDOW")
+                      result["launch_started_seconds"] = launch_started - controller_started
+                      result["launch_deadline_seconds"] = launch_deadline - controller_started
+                      channel.deadline = controller_deadline - LOG_RECEIPT_RESERVE_SECONDS
+                      job.start([sys.executable, "-B", "-u", str(root / "entry.py"), *c["args"]],
+                                root, env, stdin, stdout, stderr)
+                      # API calls can block; runtime timeout cannot depend on an upload returning.
+                      def enforce_timeout():
+                          if watchdog_done.wait(max(0.0, launch_deadline - time.monotonic())):
+                              return
+                          try:
+                              if not watchdog_done.is_set():
+                                  result["timed_out"] = True
+                                  job.stop()
+                          except BaseException:
+                              watchdog_errors.append(traceback.format_exc())
+                      watchdog = threading.Thread(target=enforce_timeout, daemon=True)
+                      watchdog.start()
+                      next_flush = time.monotonic() + 5
+                      while not job.quiescent():
+                          if watchdog_errors:
+                              raise RuntimeError("WATCHDOG_FAILURE")
+                          if time.monotonic() >= next_flush:
+                              flush(False)
+                              next_flush = time.monotonic() + 5
+                          time.sleep(0.1)
+                      # Observing completion late cannot establish that it beat the deadline.
+                      result["completion_observed_seconds"] = time.monotonic() - controller_started
+                      result["timed_out"] = result["timed_out"] or time.monotonic() >= launch_deadline
+              except BaseException:
+                  remember_error(traceback.format_exc())
+              finally:
+                  finalization_started = time.monotonic()
+                  finalization_deadline = min(controller_deadline, finalization_started + FINALIZATION_SECONDS)
+                  log_deadline = finalization_deadline - LOG_RECEIPT_RESERVE_SECONDS
+                  cleanup_deadline = finalization_deadline - CLEANUP_RECEIPT_RESERVE_SECONDS
+                  result["finalization_started_seconds"] = finalization_started - controller_started
+                  result["finalization_deadline_seconds"] = finalization_deadline - controller_started
+                  watchdog_done.set()
+                  if watchdog:
+                      watchdog.join(timeout=35)
+                  if watchdog_errors:
+                      remember_error("\n".join(watchdog_errors))
+                  if job:
+                      result["process_created"] = job.created
+                      result["launched"] = job.resumed
+                      result["job_assignment_confirmed"] = job.assigned
+                      if (launch_deadline is not None and job.created and
+                              "completion_observed_seconds" not in result and time.monotonic() >= launch_deadline):
+                          result["timed_out"] = True
+                      try:
+                          if watchdog and watchdog.is_alive():
+                              raise RuntimeError("WATCHDOG_NOT_QUIESCENT")
+                          if not job.quiescent():
+                              job.stop(124 if result["timed_out"] else 125)
+                          result["process_tree_quiescent"] = job.quiescent()
+                          if job.created and result["process_tree_quiescent"]:
+                              result["root_exit_code"] = job.exit_code()
+                      except BaseException:
+                          result["process_tree_quiescent"] = False
+                          remember_error(traceback.format_exc())
+                      finally:
+                          if not watchdog or not watchdog.is_alive():
+                              job.close()
+                  channel.deadline = log_deadline
+                  try:
+                      flush(True)
+                  except BaseException:
+                      remember_error(traceback.format_exc())
+                  for name, state in streams.items():
+                      path = root / (name + ".bin") if root is not None else None
+                      try:
+                          if path is not None and path.exists():
+                              state["capture_bytes"] = path.stat().st_size
+                              state["sha256"] = file_digest(path, log_deadline)
+                          else:
+                              state["sha256"] = digest(b"")
+                      except BaseException:
+                          remember_error(traceback.format_exc())
+                      state["unuploaded_bytes"] = max(0, state["capture_bytes"] - state["offset"])
+                  result["capture_complete"] = result["process_tree_quiescent"]
+                  result["transport_complete"] = (
+                      original_error is None and result["capture_complete"] and
+                      all(s["offset"] == s["capture_bytes"] and s["sha256"] is not None for s in streams.values()))
+                  try:
+                      if result["process_created"] and not result["process_tree_quiescent"]:
+                          raise RuntimeError("CLEANUP_ACTIVE_TREE_REFUSED")
+                      if root_created:
+                          if marker_ready:
+                              clean_owned(root, root, marker, cleanup_deadline)
+                          else:
+                              clean_startup_root(root, marker_created, cleanup_deadline)
+                      result["cleanup_complete"] = True
+                  except BaseException:
+                      remember_error(traceback.format_exc())
+                      result["transport_complete"] = False
+                  if original_error is not None:
+                      result["controller_error"] = original_error
+                  result["api_request_deadline_exceeded"] = channel.request_timed_out
+                  result["finalization_deadline_exceeded"] = time.monotonic() >= finalization_deadline
+                  result["transport_complete"] = result["transport_complete"] and not result["finalization_deadline_exceeded"]
+                  channel.deadline = finalization_deadline
+                  try:
+                      channel.put_verified(prefix + "/result.json", canonical(result))
+                  except BaseException:
+                      return 1
+              # An exit-zero workflow means transport only; business/test outcome is private.
+              return 0 if result["transport_complete"] and result["cleanup_complete"] else 1
+          
+          
+          if __name__ == "__main__":
+              try:
+                  status = main()
+              except BaseException:
+                  # Pre-channel failures cannot safely emit diagnostic data anywhere public.
+                  status = 1
+              sys.exit(status)
+          '@
+          try {
+            $null = $program | & python -B - 2>&1
+            $status = $LASTEXITCODE
+          } catch {
+            $status = 1
+          }
+          exit $status
