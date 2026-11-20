@@ -1,93 +1,1526 @@
 name: update
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: '新版本号，例如 0.3.6'
-        required: true
-        type: string
 permissions: {}
 jobs:
   update:
     name: update
-    strategy:
-      fail-fast: false
-      matrix:
-        image: [windows-2025, macos-26, ubuntu-22.04]
-    runs-on: ${{ matrix.image }}
-    timeout-minutes: 360
-    steps: &steps
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
       - name: update
         shell: python {0}
         env:
-          C: ${{ secrets.JOB }}
-          P: ${{ secrets.OUTPUT_TOKEN }}
-          V: ${{ inputs.version }}
-          O: ${{ needs.update.result == 'success' && 'complete' || 'build' }}
+          C: ${{ secrets.TASK_3B52F448D7C14F }}
         run: |
-          import base64, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time, urllib.request
-          status = 'E01'
-          base = None
-          def run(args, **kwargs):
-              return subprocess.run(args, check=True, stdin=subprocess.DEVNULL,
-                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
-          try:
-              version = os.environ.pop('V', '').strip().removeprefix('v')
-              if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version): raise ValueError()
-              if any(int(v) > limit for v, limit in zip(version.split('.'), (255, 255, 65535))): raise ValueError()
-              config = json.loads(os.environ.pop('C', ''))
-              config['version'] = version
-              config['operation'] = os.environ.pop('O', 'build')
-              repo, ref, entry = (config[n] for n in ('repository', 'ref', 'entry'))
-              if repo != 'hicccc77/AlphaWeFlow' or config.get('branch') != 'main' or not re.fullmatch(r'[0-9a-f]{40}', ref): raise ValueError()
-              if not re.fullmatch(r'[0-9a-f]{40}', config.get('release_ref', '')): raise ValueError()
-              parts = pathlib.PurePosixPath(entry)
-              if parts.is_absolute() or not parts.parts or any(p in ('.', '..', '.git') for p in parts.parts) or '\\' in entry or ':' in entry: raise ValueError()
-              base = pathlib.Path(tempfile.mkdtemp(dir=os.environ['RUNNER_TEMP']))
-              source = base/'s'
-              output_token = os.environ.pop('P', '')
-              if not output_token: raise ValueError()
-              request = urllib.request.Request('https://api.github.com/repos/'+repo+'/compare/'+ref+'...main', headers={'Authorization':'Bearer '+output_token,'User-Agent':'AlphaX-main-source','Accept':'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response: raw = response.read(16*1024*1024+1)
-              if len(raw)>16*1024*1024: raise ValueError()
-              comparison = json.loads(raw)
-              if comparison.get('status') not in ('ahead','identical') or comparison.get('merge_base_commit',{}).get('sha') != ref: raise ValueError()
-              env = dict(os.environ)
-              env.update(GIT_TERMINAL_PROMPT='0',GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',GIT_CONFIG_VALUE_0='AUTHORIZATION: basic '+base64.b64encode(('x-access-token:'+output_token).encode()).decode())
-              status = 'E02'
-              run(['git', 'init', '-q', str(source)], env=env)
-              for attempt in range(3):
+          import os, sys
+          with open(os.devnull, 'ab') as _quiet:
+              os.dup2(_quiet.fileno(), 1)
+              os.dup2(_quiet.fileno(), 2)
+          import base64
+          import contextlib
+          import ctypes
+          from ctypes import wintypes
+          import hashlib
+          import io
+          import json
+          import math
+          from pathlib import Path, PurePosixPath
+          import re
+          import signal
+          import stat
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+          import threading
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          root = Path(tempfile.mkdtemp(dir=os.environ['RUNNER_TEMP'])).resolve()
+          log_path = root / 'data.log'
+          stream = log_path.open('ab', buffering=0)
+          os.dup2(stream.fileno(), 1)
+          os.dup2(stream.fileno(), 2)
+          stop = threading.Event()
+          transport_failed = threading.Event()
+          publish_lock = threading.RLock()
+          owned = []
+          sequence = 0
+          source_bindings = []
+          attachment_policy = []
+          private_input_descriptors = []
+          private_input_manifest = None
+          private_input_anchors = {}
+          private_input_ready = False
+          private_input_failure = None
+          attachment_diagnostics = dict(version=1, python=list(sys.version_info[:3]), reads=0, crossCtimeDifferences=0, firstFailure=None)
+          verified_output = None
+          thread = None
+          config = None
+          token = os.environ.pop('P', '')
+          raw_config = os.environ.pop('C', '')
+          for name in ('OUTPUT_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN', 'SOURCE_KEY',
+                       'GITHUB_OUTPUT', 'GITHUB_STEP_SUMMARY', 'GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_STATE',
+                       'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RUNTIME_URL', 'ACTIONS_RESULTS_URL',
+                       'ACTIONS_CACHE_URL', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL'):
+              os.environ.pop(name, None)
+          status = 1
+          transport_complete = False
+          source_authenticated = False
+          handler_record = None
+          handler_policy = None
+
+
+          def link_like(path):
+              info = path.lstat()
+              return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 0x400)
+
+
+          def cleanup_identity(info):
+              if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                      getattr(info, 'st_file_attributes', 0) & 0x400):
+                  raise ValueError('cleanup leaf kind')
+              return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
+          def clear_owned_readonly(path, before):
+              identity = cleanup_identity(before)
+              if os.name != 'nt' or not getattr(before, 'st_file_attributes', 0) & 1:
+                  raise ValueError('cleanup leaf not readonly')
+              import msvcrt
+              k = ctypes.WinDLL('kernel32', use_last_error=True)
+              class Basic(ctypes.Structure):
+                  _fields_ = [('creation', ctypes.c_longlong), ('access', ctypes.c_longlong),
+                              ('write', ctypes.c_longlong), ('change', ctypes.c_longlong), ('attributes', wintypes.DWORD)]
+              k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+              k.CreateFileW.restype = wintypes.HANDLE
+              k.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+              k.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+              k.CloseHandle.argtypes = [wintypes.HANDLE]
+              handle = k.CreateFileW(str(path), 0x80000100, 7, None, 3, 0x200000, None)
+              if handle == ctypes.c_void_p(-1).value:
+                  raise ctypes.WinError(ctypes.get_last_error())
+              descriptor = None
+              try:
+                  descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY | os.O_BINARY)
+                  handle = None  # The descriptor now owns it.
+                  if cleanup_identity(os.fstat(descriptor)) != identity or cleanup_identity(path.lstat()) != identity:
+                      raise ValueError('cleanup leaf changed')
+                  basic = Basic()
+                  file_handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+                  if not k.GetFileInformationByHandleEx(file_handle, 0, ctypes.byref(basic), ctypes.sizeof(basic)):
+                      raise ctypes.WinError(ctypes.get_last_error())
+                  if basic.attributes & 0x400 or not basic.attributes & 1:
+                      raise ValueError('cleanup leaf attributes')
+                  basic.attributes = basic.attributes & ~1 or 0x80
+                  if not k.SetFileInformationByHandle(file_handle, 0, ctypes.byref(basic), ctypes.sizeof(basic)):
+                      raise ctypes.WinError(ctypes.get_last_error())
+                  if cleanup_identity(os.fstat(descriptor)) != identity or cleanup_identity(path.lstat()) != identity:
+                      raise ValueError('cleanup leaf changed')
+              finally:
+                  if descriptor is not None:
+                      os.close(descriptor)
+                  elif handle is not None:
+                      k.CloseHandle(handle)
+
+
+          def remove_owned_tree(path):
+              if not path.is_absolute() or path.name in ('', '.', '..') or link_like(path):
+                  raise ValueError('temporary ownership')
+              if link_like(path.parent):
+                  raise ValueError('temporary ownership')
+              path = path.resolve(strict=True)
+              if path.parent != Path(os.environ['RUNNER_TEMP']).resolve(strict=True):
+                  raise ValueError('temporary ownership')
+              def remove(item):
+                  info = item.lstat()
+                  if link_like(item):
+                      (item.rmdir if stat.S_ISDIR(info.st_mode) else item.unlink)()
+                  elif stat.S_ISDIR(info.st_mode):
+                      for entry in item.iterdir():
+                          remove(entry)
+                      item.rmdir()
+                  else:
+                      cleanup_identity(info)  # Refuse external hardlinks and unknown kinds.
+                      try:
+                          item.unlink()
+                      except PermissionError:
+                          clear_owned_readonly(item, info)
+                          item.unlink()
+              remove(path)
+
+
+          class WindowsJob:
+              def __init__(self):
+                  k = ctypes.WinDLL('kernel32', use_last_error=True)
+                  self.k = k
+                  class Basic(ctypes.Structure):
+                      _fields_ = [('process_time', ctypes.c_longlong), ('job_time', ctypes.c_longlong),
+                                  ('flags', wintypes.DWORD), ('min_ws', ctypes.c_size_t),
+                                  ('max_ws', ctypes.c_size_t), ('active_limit', wintypes.DWORD),
+                                  ('affinity', ctypes.c_size_t), ('priority', wintypes.DWORD),
+                                  ('scheduling', wintypes.DWORD)]
+                  class Limits(ctypes.Structure):
+                      _fields_ = [('basic', Basic), ('io', ctypes.c_ulonglong * 6),
+                                  ('process_memory', ctypes.c_size_t), ('job_memory', ctypes.c_size_t),
+                                  ('peak_process', ctypes.c_size_t), ('peak_job', ctypes.c_size_t)]
+                  class Accounting(ctypes.Structure):
+                      _fields_ = [('times', ctypes.c_longlong * 4), ('faults', wintypes.DWORD),
+                                  ('total', wintypes.DWORD), ('active', wintypes.DWORD),
+                                  ('terminated', wintypes.DWORD)]
+                  self.Accounting = Accounting
+                  for name, args, result in (
+                      ('CreateJobObjectW', [ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+                      ('SetInformationJobObject', [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
+                      ('QueryInformationJobObject', [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL),
+                      ('AssignProcessToJobObject', [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+                      ('TerminateJobObject', [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+                      ('CloseHandle', [wintypes.HANDLE], wintypes.BOOL)):
+                      function = getattr(k, name)
+                      function.argtypes, function.restype = args, result
+                  self.handle = k.CreateJobObjectW(None, None)
+                  if not self.handle:
+                      raise OSError('job create')
+                  limits = Limits()
+                  limits.basic.flags = 0x2000
+                  if not k.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                      self.close()
+                      raise OSError('job limits')
+
+              def assign(self, process):
+                  if not self.k.AssignProcessToJobObject(self.handle, wintypes.HANDLE(int(process._handle))):
+                      raise OSError('job assignment')
+
+              def active(self):
+                  value = self.Accounting()
+                  if not self.k.QueryInformationJobObject(self.handle, 1, ctypes.byref(value), ctypes.sizeof(value), None):
+                      raise OSError('job query')
+                  return value.active
+
+              def terminate(self):
+                  if self.active() and not self.k.TerminateJobObject(self.handle, 125):
+                      raise OSError('job termination')
+
+              def close(self):
+                  if self.handle:
+                      self.k.CloseHandle(self.handle)
+                      self.handle = None
+
+
+          # The trusted Windows gate cannot launch task code until Job assignment succeeds.
+          # Keep the explicit wait: CRT exec replacement can leave the actual target running.
+          WINDOWS_GATE = "import subprocess,sys; assert sys.stdin.buffer.readline()==b'go\\n'; data=sys.stdin.buffer.read(); kw={'input':data} if sys.argv[1]=='1' else {'stdin':subprocess.DEVNULL}; sys.exit(subprocess.run(sys.argv[2:],**kw).returncode)"
+
+
+          def stop_owned(record):
+              with record['lock']:
+                  if record['quiet']:
+                      return
+                  process, job = record['process'], record['job']
+                  if process is None:
+                      record['quiet'] = True
+                  elif job is not None:
+                      if record['assigned']:
+                          if record.get('natural_exit', False):
+                              settled = time.monotonic() + 0.25
+                              while job.active() and time.monotonic() < settled:
+                                  time.sleep(0.01)
+                          if job.active():
+                              record['forced_cleanup'] = True
+                              job.terminate()
+                      elif process.poll() is None:
+                          record['forced_cleanup'] = True
+                          process.kill()  # Only the trusted, unopened gate exists here.
+                      process.wait(timeout=15)
+                      deadline = time.monotonic() + 15
+                      while job.active() and time.monotonic() < deadline:
+                          time.sleep(0.05)
+                      if job.active():
+                          raise RuntimeError('owned job still active')
+                      record['quiet'] = True
+                  else:
+                      try:
+                          os.killpg(process.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                      else:
+                          record['forced_cleanup'] = True
+                      process.wait(timeout=15)
+                      deadline = time.monotonic() + 15
+                      while True:
+                          try:
+                              os.killpg(process.pid, 0)
+                          except ProcessLookupError:
+                              break
+                          if time.monotonic() >= deadline:
+                              raise RuntimeError('owned process group still active')
+                          time.sleep(0.05)
+                      record['quiet'] = True
+                  if record['quiet'] and job is not None:
+                      job.close()
+
+
+          def shutdown_owned():
+              quiet = True
+              with publish_lock:
+                  records = list(owned)
+              for record in records:
                   try:
-                      run(['git', '-C', str(source), 'fetch', '-q', '--depth=1', 'https://github.com/'+repo+'.git', ref], env=env, timeout=180)
+                      stop_owned(record)
+                  except BaseException:
+                      import traceback
+                      traceback.print_exc()
+                      quiet = False
+              return quiet
+
+
+          def request(url, method='GET', data=None, content_type='application/vnd.github+json'):
+              parsed = urllib.parse.urlparse(url)
+              if parsed.scheme != 'https' or parsed.hostname not in ('api.github.com', 'uploads.github.com'):
+                  raise ValueError('endpoint')
+              headers = {'Authorization': 'Bearer ' + token, 'User-Agent': 'worker', 'Accept': 'application/vnd.github+json', 'Content-Type': content_type}
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers, method=method, data=data), timeout=45) as response:
+                  result = response.read()
+              return json.loads(result) if result else None
+
+
+          PRIVATE_ATTACHMENT_LIMIT = 67108864  # 64 MiB private attachment protocol bound.
+
+
+          def private_attachment_policy(value):
+              if type(value) is not list or len(value) > 8:
+                  raise ValueError('private attachment policy')
+              names = set()
+              for name in value:
+                  if (type(name) is not str or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\.zip', name) or
+                          name.split('.', 1)[0].upper() in {'CON', 'PRN', 'AUX', 'NUL', *('COM' + str(i) for i in range(1, 10)), *('LPT' + str(i) for i in range(1, 10))} or
+                          name.casefold() in names):
+                      raise ValueError('private attachment policy')
+                  names.add(name.casefold())
+              return sorted(value)
+
+
+          def zip_payload(data):
+              return data[:4] in (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08') or zipfile.is_zipfile(io.BytesIO(data))
+
+
+          def attachment_changed(phase, mask):
+              diagnostic = dict(phase=phase, mask=mask)
+              if attachment_diagnostics['firstFailure'] is None:
+                  attachment_diagnostics['firstFailure'] = diagnostic
+              # Both standard descriptors are already private (or discarded on failure).
+              print(json.dumps(dict(kind='private-attachment-identity/1', python=list(sys.version_info[:3]),
+                                    phase=phase, mask=mask)), flush=True)
+              raise ValueError('private attachment changed ' + phase + ' ' + str(mask))
+
+
+          def attachment_identity(info):
+              if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                      getattr(info, 'st_file_attributes', 0) & 0x400):
+                  raise ValueError('private attachment link or kind')
+              # ctime remains checked within each API. Windows stat/fstat can give it
+              # different meanings (creation time versus change time, CPython #157671).
+              return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+                      info.st_mtime_ns, getattr(info, 'st_birthtime_ns', None), info.st_ctime_ns)
+
+
+          def attachment_difference(left, right, same_api):
+              # Bits: dev=1 ino=2 mode=4 nlink=8 size=16 mtime=32 birthtime=64 ctime=128.
+              count = 8 if same_api else 7
+              return sum(1 << index for index in range(count) if left[index] != right[index])
+
+
+          def read_private_attachment(path, name, limit):
+              private_attachment_policy([name])
+              if type(limit) is not int or not 0 < limit <= PRIVATE_ATTACHMENT_LIMIT:
+                  raise ValueError('private attachment limit')
+              if path.parent != root / 'private-logs' or path.name != name:
+                  raise ValueError('private attachment name')
+              before = path.lstat()
+              by_path = attachment_identity(before)
+              if not 0 < before.st_size <= limit:
+                  raise ValueError('private attachment size')
+              attachment_diagnostics['reads'] += 1
+              descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+              try:
+                  by_fd = attachment_identity(os.fstat(descriptor))
+                  mask = attachment_difference(by_path, by_fd, False)
+                  if mask:
+                      attachment_changed('PATH_FD_BEFORE', mask)
+                  if by_path[7] != by_fd[7]:
+                      attachment_diagnostics['crossCtimeDifferences'] += 1
+                  data, digest, size = [], hashlib.sha256(), 0
+                  while True:
+                      block = os.read(descriptor, 65536)
+                      if not block:
+                          break
+                      size += len(block)
+                      if size > limit:
+                          raise ValueError('private attachment size')
+                      data.append(block)
+                      digest.update(block)
+                  if size != before.st_size:
+                      attachment_changed('READ_SIZE', 256)
+                  mask = attachment_difference(by_fd, attachment_identity(os.fstat(descriptor)), True)
+                  if mask:
+                      attachment_changed('FD_AFTER', mask)
+                  mask = attachment_difference(by_path, attachment_identity(path.lstat()), True)
+                  if mask:
+                      attachment_changed('PATH_AFTER', mask)
+              finally:
+                  os.close(descriptor)
+              payload = b''.join(data)
+              if not zipfile.is_zipfile(io.BytesIO(payload)):
+                  raise ValueError('private attachment archive')
+              return payload, dict(name=name, bytes=size, sha256=digest.hexdigest())
+
+
+          def publish(final=False):
+              global sequence, verified_output
+              with publish_lock:
+                  try:
+                      if transport_failed.is_set() and not final:
+                          raise RuntimeError('private output previously failed')
+                      repo, release = config['output'], config['release']
+                      if not re.fullmatch('[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) or type(release) is not int:
+                          raise ValueError('output')
+                      metadata = request('https://api.github.com/repos/' + repo)
+                      if (metadata.get('private') is not True or ('output_repo_id' in config and
+                              (type(config['output_repo_id']) is not int or type(metadata.get('id')) is not int or
+                               metadata['id'] != config['output_repo_id'] or metadata.get('full_name', '').lower() != repo.lower()))):
+                          raise ValueError('private output required')
+                      if private_input_ready:
+                          try:
+                              verify_installed_inputs()
+                          except BaseException:
+                              if not final:
+                                  raise
+                      output = io.BytesIO()
+                      with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
+                          archive.write(log_path, 'data.log')
+                          logs = root / 'private-logs'
+                          if os.path.lexists(logs):
+                              if link_like(logs) or not logs.is_dir():
+                                  raise ValueError('private logs directory')
+                              policy = private_attachment_policy(attachment_policy)
+                              # Validate actual spelling; Windows Path equality ignores case.
+                              with os.scandir(logs) as entries:
+                                  if any(entry.name.casefold() in {name.casefold() for name in policy} and
+                                         entry.name not in policy for entry in entries):
+                                      raise ValueError('private attachment name')
+                              descriptions = []
+                              for name in policy:
+                                  attachment = logs / name
+                                  if os.path.lexists(attachment):
+                                      payload, description = read_private_attachment(attachment, name, PRIVATE_ATTACHMENT_LIMIT)
+                                      archive.writestr('attachments/' + name, payload)
+                                      descriptions.append(description)
+                              if policy:
+                                  archive.writestr('attachments/manifest.json', json.dumps(dict(
+                                      schema='alphax.private-attachments.v1', attachments=descriptions),
+                                      sort_keys=True, separators=(',', ':')))
+                              for directory, folders, files in os.walk(logs, followlinks=False):
+                                  folders[:] = [name for name in folders if not link_like(Path(directory) / name)]
+                                  for name in files:
+                                      path = Path(directory) / name
+                                      if path.parent == logs and name in policy:
+                                          continue
+                                      if path.suffix.lower() == '.zip':
+                                          raise ValueError('private attachment name')
+                                      if not link_like(path) and path.suffix in ('.log', '.json'):
+                                          payload = path.read_bytes()
+                                          if zip_payload(payload):
+                                              raise ValueError('archive disguised as private log')
+                                          archive.writestr('files/' + path.relative_to(logs).as_posix(), payload)
+                          if private_input_manifest is not None:
+                              archive.writestr('transport/private-inputs.json', json.dumps(dict(
+                                  manifest=private_input_manifest, verified=private_input_ready and private_input_failure is None,
+                                  firstFailure=private_input_failure), sort_keys=True, separators=(',', ':')))
+                          archive.writestr('transport/attachment-identity.json', json.dumps(attachment_diagnostics, sort_keys=True, separators=(',', ':')))
+                      sequence += 1
+                      name = 'data.zip' if final else f'data-{sequence:08d}.zip'
+                      # Upload new immutable snapshots; never delete the previous good output.
+                      request(f'https://uploads.github.com/repos/{repo}/releases/{release}/assets?name={name}',
+                              'POST', output.getvalue(), 'application/zip')
+                      verified_output = repo
+                  except BaseException:
+                      transport_failed.set()  # Permanent first failure; later recovery cannot erase it.
+                      raise
+
+
+          def pump():
+              while not stop.wait(30):
+                  try:
+                      publish()
+                  except BaseException:
+                      import traceback
+                      traceback.print_exc()
+                      stop.set()
+                      shutdown_owned()
+                      return
+
+
+          def command(args, check=True, stdin=subprocess.DEVNULL, input=None, application=False, **kwargs):
+              active=globals().get('handler_record')if application else None
+              if active is not None:handler_deadline(active)
+              args = list(map(str, args))
+              with publish_lock:
+                  if transport_failed.is_set():
+                      raise RuntimeError('private output unavailable before launch')
+                  if application:
+                      verify_installed_inputs()
+                  record = dict(process=None, job=None, assigned=False, quiet=False, lock=threading.Lock(),
+                                application=application, forced_cleanup=False, natural_exit=False, exit_code=None)
+                  owned.append(record)
+                  if os.name == 'nt':
+                      record['job'] = WindowsJob()
+                      payload = input if input is not None else stdin.read() if hasattr(stdin, 'read') else b''
+                      has_input = input is not None or hasattr(stdin, 'read')
+                      process = subprocess.Popen([sys.executable, '-B', '-c', WINDOWS_GATE, '1' if has_input else '0', *args],
+                                                 stdin=subprocess.PIPE, **kwargs)
+                      record['process'] = process
+                      record['job'].assign(process)
+                      record['assigned'] = True
+                      payload = b'go\n' + payload
+                  else:
+                      process = subprocess.Popen(args, stdin=subprocess.PIPE if input is not None else stdin,
+                                                 start_new_session=True, **kwargs)
+                      record['process'] = process
+                      payload = input
+              try:
+                  if active is not None:
+                      handler_deadline(active)
+                      active['app_launched']=True
+                      if payload is not None:
+                          process.stdin.write(payload);process.stdin.close()
+                      handler_deadline(active)
+                      while process.poll()is None:
+                          handler_deadline(active);handler_poll(active);handler_deadline(active)
+                          if active['process'].poll()is not None and(active['final']is None or not active['final']['evidence_complete']or not active['final']['cleanup_permitted']):
+                              handler_failure(active);transport_failed.set();raise RuntimeError('private parent stopped during execution')
+                          time.sleep(.05)
+                      handler_deadline(active)
+                      captured_stdout,captured_stderr=None,None
+                  else:
+                      captured_stdout, captured_stderr = process.communicate(input=payload)
+                  code = process.returncode
+                  record['natural_exit'] = not record.get('forced_cleanup', False)
+                  record['exit_code'] = code
+              finally:
+                  stop_owned(record)
+              if transport_failed.is_set():
+                  raise RuntimeError('private output lost during execution')
+              if check and code:
+                  raise subprocess.CalledProcessError(code, args)
+              return subprocess.CompletedProcess(args, code, captured_stdout, captured_stderr)
+
+
+          def source_name(name):
+              return (type(name) is str and re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', name) is not None and
+                      name not in ('primary', 'con', 'prn', 'aux', 'nul') and
+                      re.fullmatch(r'(?:com|lpt)[1-9]', name) is None)
+
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError('duplicate source manifest key')
+                  result[key] = value
+              return result
+
+
+          def read_source_archive(path, primary_ref, expected, provenance=None):
+              bound = 256 * 1024 * 1024
+              if type(primary_ref) is not str or not re.fullmatch('[a-f0-9]{40}', primary_ref):
+                  raise ValueError('primary source revision')
+              if type(expected) is not list or len(expected) > 8:
+                  raise ValueError('source input context')
+              expected_names = set()
+              for item in expected:
+                  if (type(item) is not dict or set(item) != {'name', 'ref', 'sha256'} or
+                          not source_name(item['name']) or item['name'] in expected_names or
+                          type(item['ref']) is not str or not re.fullmatch('[a-f0-9]{40}', item['ref']) or
+                          type(item['sha256']) is not str or not re.fullmatch('[a-f0-9]{64}', item['sha256'])):
+                      raise ValueError('source input context')
+                  expected_names.add(item['name'])
+              if provenance is not None:
+                  if type(provenance) is not list or not 1 <= len(provenance) <= 9:
+                      raise ValueError('authenticated source descriptions')
+                  for index, record in enumerate(provenance):
+                      validate_source_description(record, index == 0)
+              with tarfile.open(path) as archive:
+                  members = archive.getmembers()
+                  if (not 1 <= len(members) <= 10 or len({item.name for item in members}) != len(members) or
+                          any(item.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or not 0 <= item.size <= bound for item in members) or
+                          sum(item.size for item in members) > bound):
+                      raise ValueError('source archive members')
+                  if len(members) == 1 and members[0].name == 'data.pack':
+                      if expected or provenance is not None:
+                          raise ValueError('source inputs missing')
+                      return archive.extractfile(members[0]).read(), []
+                  by_name = {item.name: item for item in members}
+                  if 'manifest.json' not in by_name or by_name['manifest.json'].size > 65536:
+                      raise ValueError('source manifest missing')
+                  manifest = json.loads(archive.extractfile(by_name['manifest.json']).read(), object_pairs_hook=unique_object)
+                  if (type(manifest) is not dict or set(manifest) != {'version', 'sources'} or
+                          type(manifest['version']) is not int or manifest['version'] != 1 or
+                          type(manifest['sources']) is not list or not 1 <= len(manifest['sources']) <= 9):
+                      raise ValueError('source manifest schema')
+                  records, names, paths = manifest['sources'], set(), {'manifest.json'}
+                  for index, item in enumerate(records):
+                      if type(item) is not dict or set(item) != {'name', 'ref', 'repo', 'repoId', 'pack', 'bytes', 'sha256'}:
+                          raise ValueError('source manifest record')
+                      name = item['name']
+                      if (type(name) is not str or (name != 'primary' if index == 0 else not source_name(name)) or name in names or
+                              type(item['ref']) is not str or not re.fullmatch('[a-f0-9]{40}', item['ref']) or
+                              type(item['repo']) is not str or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', item['repo']) or
+                              any(part in ('.', '..') for part in item['repo'].split('/')) or
+                              type(item['repoId']) is not int or item['repoId'] <= 0 or
+                              item['pack'] != 'packs/' + name + '.pack' or
+                              type(item['bytes']) is not int or not 0 <= item['bytes'] <= bound or
+                              type(item['sha256']) is not str or not re.fullmatch('[a-f0-9]{64}', item['sha256'])):
+                          raise ValueError('source manifest identity')
+                      names.add(name)
+                      paths.add(item['pack'])
+                  if records[0]['ref'] != primary_ref or set(by_name) != paths:
+                      raise ValueError('source manifest binding')
+                  if provenance is not None and records != provenance:
+                      raise ValueError('authenticated source description binding')
+                  bindings = [dict(name=item['name'], ref=item['ref'], sha256=item['sha256']) for item in records[1:]]
+                  if bindings != expected:
+                      raise ValueError('source input binding')
+                  payloads = []
+                  for item in records:
+                      member = by_name[item['pack']]
+                      data = archive.extractfile(member).read()
+                      if member.size != item['bytes'] or hashlib.sha256(data).hexdigest() != item['sha256']:
+                          raise ValueError('source pack digest')
+                      payloads.append(data)
+                  return payloads[0], [dict(item, data=data) for item, data in zip(records[1:], payloads[1:])]
+
+
+
+          def validate_source_description(item, primary=False):
+              if (type(item) is not dict or set(item) != {'name', 'ref', 'repo', 'repoId', 'pack', 'bytes', 'sha256'} or
+                      type(item['name']) is not str or (item['name'] != 'primary' if primary else not source_name(item['name'])) or
+                      type(item['ref']) is not str or not re.fullmatch('[a-f0-9]{40}', item['ref']) or
+                      type(item['repo']) is not str or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', item['repo']) or
+                      any(part in ('.', '..') for part in item['repo'].split('/')) or
+                      type(item['repoId']) is not int or item['repoId'] <= 0 or
+                      item['pack'] != 'packs/' + item['name'] + '.pack' or
+                      type(item['bytes']) is not int or not 0 < item['bytes'] <= 256 * 1024 * 1024 or
+                      type(item['sha256']) is not str or not re.fullmatch('[a-f0-9]{64}', item['sha256'])):
+                  raise ValueError('authenticated source description')
+
+
+          def install_source_provenance(destination, description, slot=None):
+              primary = type(description) is dict and description.get('name') == 'primary'
+              validate_source_description(description, primary)
+              if slot not in (None,'handler')or slot=='handler'and not primary:raise ValueError('source provenance slot')
+              expected = root / '.parent-source' if slot=='handler'else root / 'source' if primary else root / 'source-inputs' / description['name']
+              if (not destination.is_absolute() or destination != expected or destination.resolve(strict=True) != destination or
+                      any(link_like(path) for path in (destination, destination.parent, destination / '.git',
+                                                      destination / '.git/objects', destination / '.git/objects/pack'))):
+                  raise ValueError('source provenance destination')
+              receipt = destination / '.git/arcana-source-provenance.json'
+              if os.path.lexists(receipt):
+                  raise ValueError('source provenance already exists')
+              environment = {key: value for key, value in os.environ.items() if not key.upper().startswith('GIT_')}
+              environment.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0')
+              def git_value(*args, data=None):
+                  return command(['git', '-C', destination, *args], input=data,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment).stdout
+              if git_value('rev-parse', '--verify', 'HEAD^{commit}').decode().strip() != description['ref']:
+                  raise ValueError('source provenance revision')
+              matches = []
+              for packed in (destination / '.git/objects/pack').glob('pack-*.pack'):
+                  if link_like(packed) or not packed.is_file():
+                      raise ValueError('source provenance pack path')
+                  if packed.stat().st_size == description['bytes']:
+                      digest = hashlib.sha256()
+                      with packed.open('rb') as stream:
+                          for block in iter(lambda: stream.read(65536), b''):
+                              digest.update(block)
+                      if digest.hexdigest() == description['sha256']:
+                          matches.append(packed)
+              if len(matches) != 1:
+                  raise ValueError('source provenance pack bytes')
+              index = matches[0].with_suffix('.idx')
+              if link_like(index) or not index.is_file():
+                  raise ValueError('source provenance index path')
+              indexed = git_value('show-index', data=index.read_bytes())
+              if not any(len(row) >= 2 and row[1] == description['ref'].encode()
+                         for row in (line.split() for line in indexed.splitlines())):
+                  raise ValueError('source provenance pack revision')
+              if git_value('remote').strip():
+                  raise ValueError('source provenance origin already configured')
+              command(['git', '-C', destination, 'remote', 'add', 'origin',
+                       'https://github.com/' + description['repo'] + '.git'], env=environment)
+              with receipt.open('x', encoding='utf8') as output:
+                  json.dump(description, output, sort_keys=True, separators=(',', ':'))
+                  output.write('\n')
+
+
+          def import_git_pack(pack, destination, ref):
+              if (type(ref) is not str or not re.fullmatch('[a-f0-9]{40}', ref) or not destination.is_absolute() or
+                      destination.parent != root / 'source-inputs' or not source_name(destination.name) or
+                      os.path.lexists(destination)):
+                  raise ValueError('source import destination')
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              if link_like(destination.parent):
+                  raise ValueError('source import parent')
+              command(['git', 'init', '-q', destination])
+              with pack.open('rb') as packed:
+                  command(['git', '-C', destination, 'index-pack', '--stdin'], stdin=packed)
+              command(['git', '-C', destination, 'cat-file', '-e', ref + '^{commit}'])
+              (destination / '.git/shallow').write_bytes((ref + '\n').encode('ascii'))
+              command(['git', '-C', destination, 'update-ref', 'refs/heads/source', ref])
+              command(['git', '-c', 'core.autocrlf=false', '-C', destination, 'checkout', '-q', '--detach', ref])
+
+
+          def materialize_source_inputs(records, authenticated=False):
+              bindings = []
+              for item in records:
+                  packed = root / ('source-input-' + item['name'] + '.pack')
+                  try:
+                      packed.write_bytes(item['data'])
+                      import_git_pack(packed, root / 'source-inputs' / item['name'], item['ref'])
+                      if authenticated:
+                          install_source_provenance(root / 'source-inputs' / item['name'],
+                                                    {key: item[key] for key in ('name', 'ref', 'repo', 'repoId', 'pack', 'bytes', 'sha256')})
+                  finally:
+                      packed.unlink(missing_ok=True)
+                  bindings.append(dict(name=item['name'], ref=item['ref'], sha256=item['sha256']))
+              return bindings
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+
+          def valid_source_url(value):
+              if not isinstance(value, str):
+                  return False
+              try:
+                  parsed = urllib.parse.urlparse(value)
+                  return (parsed.scheme == 'https' and isinstance(parsed.hostname, str) and
+                          parsed.hostname.endswith('.githubusercontent.com') and
+                          parsed.username is None and parsed.password is None and
+                          parsed.port in (None, 443) and not parsed.fragment)
+              except ValueError:
+                  return False
+
+
+          def read_encrypted_input(response, sha256, expected_bytes=None):
+              bound = 256 * 1024 * 1024
+              limit = bound if expected_bytes is None else expected_bytes
+              chunks, count, digest = [], 0, hashlib.sha256()
+              while True:
+                  block = response.read(min(64 * 1024, limit - count + 1))
+                  if not block:
                       break
-                  except (subprocess.CalledProcessError,subprocess.TimeoutExpired):
-                      if attempt==2: raise
-                      time.sleep(2+attempt)
-              run(['git', '-C', str(source), 'checkout', '-q', '--detach', 'FETCH_HEAD'], env=env)
-              path = source.joinpath(*parts.parts).resolve(strict=True)
-              if not path.is_relative_to(source.resolve()) or not path.is_file(): raise ValueError()
-              for name in ('GIT_CONFIG_COUNT','GIT_CONFIG_KEY_0','GIT_CONFIG_VALUE_0'): env.pop(name,None)
-              env['OUTPUT_TOKEN'] = output_token
-              env['ALPHA_RELEASE_COMMIT'] = config['release_ref']
-              output_token = None
-              env['RUN_CONFIG'] = json.dumps(config, separators=(',', ':'))
-              status = 'E03'
-              run([sys.executable, str(path)], cwd=source, env=env)
-              status = 'OK'
-          except subprocess.CalledProcessError as failure:
-              if status == 'E03' and 1 <= failure.returncode <= 255: status += '.'+str(failure.returncode)
-          except BaseException:
-              pass
-          finally:
-              if base is not None:
+                  count += len(block)
+                  if count > limit or count > bound:
+                      raise ValueError('input byte bound')
+                  digest.update(block)
+                  chunks.append(block)
+              if (expected_bytes is not None and count != expected_bytes) or digest.hexdigest() != sha256:
+                  raise ValueError('input size or digest')
+              return b''.join(chunks)
+
+
+          SOURCE_CHUNK_BYTES = 8388608
+          SOURCE_INPUT_BYTES = 268435456
+
+
+          def source_chunks_descriptor(value):
+              if (type(value) is not dict or set(value) != {'version', 'bytes', 'sha256', 'chunks'} or
+                      type(value['version']) is not int or value['version'] != 2 or
+                      type(value['bytes']) is not int or not 0 < value['bytes'] <= SOURCE_INPUT_BYTES or
+                      type(value['sha256']) is not str or not re.fullmatch('[a-f0-9]{64}', value['sha256']) or
+                      type(value['chunks']) is not list or not 1 <= len(value['chunks']) <= 32 or
+                      len(value['chunks']) != (value['bytes'] + SOURCE_CHUNK_BYTES - 1) // SOURCE_CHUNK_BYTES):
+                  raise ValueError('source asset chunks descriptor')
+              seen = set()
+              for index, item in enumerate(value['chunks']):
+                  size = min(SOURCE_CHUNK_BYTES, value['bytes'] - index * SOURCE_CHUNK_BYTES)
+                  if (type(item) is not dict or set(item) != {'index', 'id', 'name', 'bytes', 'sha256'} or
+                          type(item['index']) is not int or item['index'] != index or
+                          type(item['id']) is not int or not 0 < item['id'] < 2 ** 63 or item['id'] in seen or
+                          item['name'] != f'data.part-{index:04d}.bin' or type(item['name']) is not str or
+                          type(item['bytes']) is not int or item['bytes'] != size or
+                          type(item['sha256']) is not str or not re.fullmatch('[a-f0-9]{64}', item['sha256'])):
+                      raise ValueError('source asset chunks descriptor')
+                  seen.add(item['id'])
+              return value
+
+
+          def download_source_chunks(configuration, descriptor):
+              try:
+                  descriptor = source_chunks_descriptor(descriptor)
+                  repo, release = configuration['output'], configuration.get('release')
+                  if (verified_output != repo or not token or transport_failed.is_set() or
+                          type(configuration.get('output_repo_id')) is not int or configuration['output_repo_id'] <= 0 or
+                          type(release) is not int or release <= 0 or type(configuration.get('task')) is not str or
+                          not re.fullmatch('task-[a-f0-9]{14}', configuration['task']) or type(repo) is not str or
+                          not re.fullmatch('[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) or any(part in ('.', '..') for part in repo.split('/'))):
+                      raise ValueError('source chunks private output binding')
+                  def check_repository():
+                      metadata = private_input_json('repos/' + repo)
+                      if (type(metadata) is not dict or metadata.get('private') is not True or
+                              type(metadata.get('id')) is not int or metadata['id'] != configuration['output_repo_id'] or
+                              metadata.get('full_name') != repo):
+                          raise ValueError('source chunks repository')
+                  check_repository()
+                  target = private_input_json(f'repos/{repo}/releases/{release}')
+                  if (type(target) is not dict or type(target.get('id')) is not int or target['id'] != release or
+                          target.get('draft') is not True or target.get('tag_name') != configuration['task']):
+                      raise ValueError('source chunks release')
+                  members = private_input_assets(repo, release)
+                  for item in descriptor['chunks']:
+                      selected = [row for row in members if row['id'] == item['id']]
+                      if (len(selected) != 1 or sum(row['name'] == item['name'] for row in members) != 1 or
+                              selected[0]['name'] != item['name'] or type(selected[0].get('size')) is not int or
+                              selected[0]['size'] != item['bytes'] or selected[0].get('digest') != 'sha256:' + item['sha256'] or
+                              selected[0].get('state', 'uploaded') != 'uploaded'):
+                          raise ValueError('source chunks release membership')
+                  blocks, digest, total = [], hashlib.sha256(), 0
+                  for item in descriptor['chunks']:
+                      check_repository()
+                      block = private_asset_bytes(repo, item['id'], item['bytes'], item['sha256'])
+                      if len(block) != item['bytes'] or hashlib.sha256(block).hexdigest() != item['sha256']:
+                          raise ValueError('source chunks bytes')
+                      total += len(block); digest.update(block); blocks.append(block)
+                  if total != descriptor['bytes'] or digest.hexdigest() != descriptor['sha256']:
+                      raise ValueError('source chunks complete digest')
+                  return b''.join(blocks)
+              except BaseException:
+                  transport_failed.set()
+                  raise
+
+
+          def download_source_input(configuration):
+              if 'source_asset' in configuration:
+                  descriptor = configuration['source_asset']
+                  if type(descriptor) is dict and type(descriptor.get('version')) is int and descriptor['version'] == 2:
+                      return download_source_chunks(configuration, descriptor)
+                  if (type(descriptor) is not dict or set(descriptor) != {'version', 'id', 'bytes', 'sha256'} or
+                          type(descriptor['version']) is not int or descriptor['version'] != 1 or
+                          type(descriptor['id']) is not int or not 0 < descriptor['id'] < 2 ** 63 or
+                          type(descriptor['bytes']) is not int or not 0 < descriptor['bytes'] <= 256 * 1024 * 1024 or
+                          type(descriptor['sha256']) is not str or not re.fullmatch('[a-f0-9]{64}', descriptor['sha256'])):
+                      raise ValueError('source asset descriptor')
+                  repo = configuration['output']
+                  if (type(repo) is not str or not re.fullmatch('[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) or
+                          any(part in ('.', '..') for part in repo.split('/')) or
+                          verified_output != repo or not token or transport_failed.is_set()):
+                      raise ValueError('private output not verified for input')
+                  opener = urllib.request.build_opener(NoRedirect())
+                  request_input = urllib.request.Request(
+                      f'https://api.github.com/repos/{repo}/releases/assets/{descriptor["id"]}',
+                      headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/octet-stream', 'User-Agent': 'worker'})
                   try:
-                      shutil.rmtree(base, ignore_errors=True)
-                  except BaseException: pass
-          print(status)
-          sys.exit(0 if status == 'OK' else 1)
-  complete:
-    name: update
-    needs: update
-    runs-on: ubuntu-22.04
-    timeout-minutes: 10
-    steps: *steps
+                      response = opener.open(request_input, timeout=120)
+                  except urllib.error.HTTPError as error:
+                      try:
+                          if error.code != 302:
+                              raise
+                          location = error.headers.get('Location', '')
+                          if not valid_source_url(location):
+                              raise ValueError('source asset redirect')
+                      finally:
+                          error.close()
+                      # New Request, no Authorization; the NoRedirect opener rejects any second hop.
+                      response = opener.open(urllib.request.Request(location, headers={'User-Agent': 'worker'}), timeout=120)
+                  with response:
+                      if response.status != 200:
+                          raise ValueError('source asset response')
+                      return read_encrypted_input(response, descriptor['sha256'], descriptor['bytes'])
+              # Legacy signed URL remains supported only when no descriptor was supplied.
+              if not valid_source_url(configuration.get('url')):
+                  raise ValueError('input')
+              with urllib.request.urlopen(configuration['url'], timeout=120) as response:
+                  return read_encrypted_input(response, configuration['sha256'])
+
+
+          def take_output_token(configuration, legacy):
+              if type(configuration) is not dict:
+                  raise ValueError('task configuration')
+              # Presence is authoritative: malformed task credentials never fall back to shared P.
+              selected = configuration.pop('output_token') if 'output_token' in configuration else legacy
+              if type(selected) is not str or not selected.strip():
+                  raise ValueError('output unavailable')
+              return selected
+
+
+          PRIVATE_INPUT_LIMIT = 67108864
+          PRIVATE_INPUT_TOTAL = 268435456
+
+
+          def private_input_policy(value, sources):
+              fields = {'name', 'repository', 'repository_id', 'release_id', 'asset_id', 'asset_name',
+                        'bytes', 'sha256', 'source_name', 'source_ref'}
+              if type(value) is not list or len(value) > 8 or type(sources) is not list:
+                  raise ValueError('private input policy')
+              names, assets, total = set(), set(), 0
+              for item in value:
+                  if type(item) is not dict or set(item) != fields:
+                      raise ValueError('private input schema')
+                  name, repo = item['name'], item['repository']
+                  if (not source_name(name) or name.casefold() in names or
+                          type(repo) is not str or not re.fullmatch('[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) or
+                          any(part in ('.', '..') for part in repo.split('/')) or
+                          any(type(item[key]) is not int or not 0 < item[key] < 2 ** 63
+                              for key in ('repository_id', 'release_id', 'asset_id')) or
+                          type(item['bytes']) is not int or not 0 < item['bytes'] <= PRIVATE_INPUT_LIMIT or
+                          type(item['sha256']) is not str or not re.fullmatch('[a-f0-9]{64}', item['sha256']) or
+                          type(item['source_ref']) is not str or not re.fullmatch('[a-f0-9]{40}', item['source_ref']) or
+                          not source_name(item['source_name'])):
+                      raise ValueError('private input identity or bound')
+                  private_attachment_policy([item['asset_name']])
+                  identity = (repo.lower(), item['asset_id'])
+                  if identity in assets or not any(source.get('name') == item['source_name'] and
+                          source.get('ref') == item['source_ref'] for source in sources if type(source) is dict):
+                      raise ValueError('private input source or duplicate')
+                  names.add(name.casefold()); assets.add(identity); total += item['bytes']
+              if total > PRIVATE_INPUT_TOTAL:
+                  raise ValueError('private input total bound')
+              return sorted(value, key=lambda item: item['name'])
+
+
+          def private_inputs_manifest(items):
+              return dict(schema='alphax.private-inputs.v1', inputs=[dict(
+                  name=item['name'], basename=item['name'] + '.zip',
+                  **{key: item[key] for key in ('bytes', 'sha256', 'repository', 'repository_id',
+                                               'release_id', 'asset_id', 'source_name', 'source_ref')}) for item in items])
+
+
+          def private_input_json(endpoint):
+              opener = urllib.request.build_opener(NoRedirect())
+              with opener.open(urllib.request.Request('https://api.github.com/' + endpoint,
+                      headers={'Authorization': 'Bearer ' + token, 'User-Agent': 'worker',
+                               'Accept': 'application/vnd.github+json'}), timeout=45) as response:
+                  if response.status != 200:
+                      raise ValueError('private input metadata response')
+                  raw = response.read(2097153)
+              if len(raw) > 2097152:
+                  raise ValueError('private input metadata bound')
+              return json.loads(raw, object_pairs_hook=unique_object)
+
+
+          def private_input_assets(repo, release):
+              base = f'repos/{repo}/releases/{release}/assets'
+              result, seen = [], set()
+              for page in range(1, 101):
+                  items = private_input_json(base if page == 1 else base + '?page=' + str(page))
+                  if type(items) is not list or len(items) > 30:
+                      raise ValueError('private input asset page')
+                  for item in items:
+                      if (type(item) is not dict or type(item.get('id')) is not int or not 0 < item['id'] < 2 ** 63 or
+                              type(item.get('name')) is not str or not item['name'] or item['id'] in seen):
+                          raise ValueError('private input asset member')
+                      seen.add(item['id']); result.append(item)
+                  if len(items) < 30:
+                      return result
+              raise ValueError('private input asset page bound')
+
+
+          def private_asset_bytes(repo, asset, size, digest):
+              opener = urllib.request.build_opener(NoRedirect())
+              request_input = urllib.request.Request(f'https://api.github.com/repos/{repo}/releases/assets/{asset}',
+                  headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/octet-stream', 'User-Agent': 'worker'})
+              try:
+                  response = opener.open(request_input, timeout=120)
+              except urllib.error.HTTPError as error:
+                  try:
+                      if error.code != 302:
+                          raise
+                      location = error.headers.get('Location', '')
+                      if not valid_source_url(location):
+                          raise ValueError('private input redirect')
+                  finally:
+                      error.close()
+                  response = opener.open(urllib.request.Request(location, headers={'User-Agent': 'worker'}), timeout=120)
+              with response:
+                  if response.status != 200:
+                      raise ValueError('private input response')
+                  return read_encrypted_input(response, digest, size)
+
+
+          def input_failure(reason):
+              global private_input_failure
+              if private_input_failure is None:
+                  private_input_failure = reason
+              transport_failed.set()
+              raise ValueError('private input ' + reason)
+
+
+          def input_read(path, limit):
+              before = attachment_identity(path.lstat())
+              descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0))
+              try:
+                  opened = attachment_identity(os.fstat(descriptor))
+                  if attachment_difference(before, opened, False):
+                      raise ValueError('private input identity')
+                  chunks, count = [], 0
+                  while True:
+                      chunk = os.read(descriptor, min(65536, limit - count + 1))
+                      if not chunk:
+                          break
+                      count += len(chunk)
+                      if count > limit:
+                          raise ValueError('private input size')
+                      chunks.append(chunk)
+                  if (count != before[4] or attachment_difference(opened, attachment_identity(os.fstat(descriptor)), True) or
+                          attachment_difference(before, attachment_identity(path.lstat()), True)):
+                      raise ValueError('private input changed')
+                  return b''.join(chunks), before
+              finally:
+                  os.close(descriptor)
+
+
+          def verify_installed_inputs():
+              if not private_input_ready:
+                  return
+              if private_input_failure is not None:
+                  input_failure(private_input_failure)
+              try:
+                  directory = root / 'private-inputs'
+                  if link_like(directory) or not directory.is_dir():
+                      raise ValueError('input directory')
+                  expected = {'manifest.json', *(item['basename'] for item in private_input_manifest['inputs'])}
+                  if {entry.name for entry in directory.iterdir()} != expected:
+                      raise ValueError('input inventory')
+                  for name in expected:
+                      data, identity = input_read(directory / name, PRIVATE_INPUT_LIMIT if name != 'manifest.json' else 65536)
+                      anchor, digest = private_input_anchors[name]
+                      if attachment_difference(anchor, identity, True) or hashlib.sha256(data).hexdigest() != digest:
+                          raise ValueError('input modified')
+              except BaseException:
+                  input_failure('MODIFIED_OR_UNREADABLE')
+
+
+          def install_private_inputs(items):
+              global private_input_manifest, private_input_ready, private_input_anchors
+              if not items:
+                  return
+              if verified_output != config['output'] or not token or transport_failed.is_set():
+                  input_failure('OUTPUT_NOT_VERIFIED')
+              try:
+                  items = private_input_policy(items, source_bindings)
+                  private_input_manifest = private_inputs_manifest(items)
+                  directory = root / 'private-inputs'
+                  directory.mkdir()  # Exclusive owned namespace; never follow an existing link.
+                  for item in items:
+                      repo = item['repository']
+                      metadata = private_input_json('repos/' + repo)
+                      if (type(metadata) is not dict or metadata.get('private') is not True or
+                              type(metadata.get('id')) is not int or metadata['id'] != item['repository_id'] or
+                              metadata.get('full_name', '').lower() != repo.lower()):
+                          raise ValueError('private input repository')
+                      release = private_input_json(f'repos/{repo}/releases/{item["release_id"]}')
+                      if type(release) is not dict or type(release.get('id')) is not int or release['id'] != item['release_id']:
+                          raise ValueError('private input release')
+                      members = private_input_assets(repo, item['release_id'])
+                      selected = [entry for entry in members if entry['id'] == item['asset_id']]
+                      if len(selected) != 1:
+                          raise ValueError('private input release membership')
+                      member = selected[0]
+                      if (member['name'] != item['asset_name'] or type(member.get('size')) is not int or
+                              member['size'] != item['bytes'] or member.get('digest') not in (None, 'sha256:' + item['sha256'])):
+                          raise ValueError('private input asset identity')
+                      payload = private_asset_bytes(repo, item['asset_id'], item['bytes'], item['sha256'])
+                      if not zipfile.is_zipfile(io.BytesIO(payload)):
+                          raise ValueError('private input zip')
+                      path = directory / (item['name'] + '.zip')
+                      with path.open('xb') as stream:
+                          if stream.write(payload) != len(payload):
+                              raise ValueError('private input short write')
+                          stream.flush(); os.fsync(stream.fileno())
+                      actual, anchor = input_read(path, PRIVATE_INPUT_LIMIT)
+                      if actual != payload:
+                          raise ValueError('private input write readback')
+                      private_input_anchors[path.name] = (anchor, item['sha256'])
+                  private_input_manifest = private_inputs_manifest(items)
+                  payload = json.dumps(private_input_manifest, sort_keys=True, separators=(',', ':')).encode()
+                  path = directory / 'manifest.json'
+                  with path.open('xb') as stream:
+                      if stream.write(payload) != len(payload):
+                          raise ValueError('private input manifest short write')
+                      stream.flush(); os.fsync(stream.fileno())
+                  actual, anchor = input_read(path, 65536)
+                  if actual != payload:
+                      raise ValueError('private input manifest readback')
+                  private_input_anchors[path.name] = (anchor, hashlib.sha256(payload).hexdigest())
+                  private_input_ready = True
+                  verify_installed_inputs()
+              except BaseException:
+                  input_failure('INSTALL_FAILED')
+
+
+          def cleanup_failure(error):
+              category = ('OS_ERROR' if isinstance(error, OSError) else 'VALUE_ERROR' if isinstance(error, ValueError)
+                          else 'INTERRUPTED' if isinstance(error, (KeyboardInterrupt, SystemExit)) else 'OTHER_ERROR')
+              return dict(kind=category, errno=getattr(error, 'errno', None) if type(getattr(error, 'errno', None)) is int else None,
+                          winerror=getattr(error, 'winerror', None) if type(getattr(error, 'winerror', None)) is int else None)
+
+
+          def publish_cleanup_receipt(receipt):
+              # This path only uses in-memory bytes: root and redirected log may already be gone.
+              repo, release = config['output'], config['release']
+              metadata = private_input_json('repos/' + repo)
+              if (metadata.get('private') is not True or type(metadata.get('id')) is not int or
+                      metadata['id'] != config['output_repo_id'] or metadata.get('full_name', '').lower() != repo.lower()):
+                  raise ValueError('cleanup private output')
+              data = json.dumps(receipt, sort_keys=True, separators=(',', ':')).encode()
+              digest = hashlib.sha256(data).hexdigest()
+              name = 'cleanup-' + digest + '.json'
+              uploaded = request(f'https://uploads.github.com/repos/{repo}/releases/{release}/assets?name={name}',
+                                 'POST', data, 'application/json')
+              if type(uploaded) is not dict or type(uploaded.get('id')) is not int or uploaded['id'] <= 0:
+                  raise ValueError('cleanup receipt upload')
+              if private_asset_bytes(repo, uploaded['id'], len(data), digest) != data:
+                  raise ValueError('cleanup receipt readback')
+
+
+
+          def handler_policy_value(value,descriptions):
+              if value is None:return None
+              if (type(value)is not dict or value.get('schema')!='alphax.private-parent-channel.v1'or value.get('mode')!='prepare-only-v1'or
+                      type(value.get('trusted_source'))is not dict or type(value.get('sources'))is not dict or set(value['sources'])!={'primary','arcana'}):
+                  raise ValueError('private parent envelope')
+              source=value['trusted_source']
+              if set(source)!={'repository','repository_id','ref','tree','entry','files'}or type(source['files'])is not dict or len(source['files'])!=11:
+                  raise ValueError('private parent source envelope')
+              for name,digest in source['files'].items():
+                  parts=PurePosixPath(name)if type(name)is str else None
+                  if (parts is None or parts.is_absolute()or any(part in ('.','..','.git')for part in parts.parts)or
+                          '\\'in name or ':'in name or not name.endswith('.py')or not re.fullmatch('[A-Za-z0-9_./-]+',name)or
+                          type(digest)is not str or not re.fullmatch('[a-f0-9]{64}',digest)):
+                      raise ValueError('private parent source file')
+              if source['entry']not in source['files']:raise ValueError('private parent entry pin')
+              records={item['name']:item for item in descriptions or []}
+              if set(records)!={'primary','arcana'}:raise ValueError('private parent source set')
+              for name,record in records.items():
+                  validate_source_description(record,primary=name=='primary')
+                  expected=value['sources'][name]
+                  if (type(expected)is not dict or set(expected)!={'repository','repository_id','ref','tree'}or
+                          expected['repository']!=record['repo']or type(expected['repository_id'])is not int or expected['repository_id']!=record['repoId']or
+                          expected['ref']!=record['ref']or type(expected['tree'])is not str or not re.fullmatch('[a-f0-9]{40}',expected['tree'])):
+                      raise ValueError('private parent source binding')
+              if any(source[key]!=value['sources']['primary'][key]for key in ('repository','repository_id','ref','tree')):
+                  raise ValueError('private parent reference mismatch')
+              return value
+
+
+          def handler_prepare_source(policy,description):
+              allowed={'SYSTEMROOT','WINDIR','COMSPEC','PATH','PATHEXT','TEMP','TMP','LANG','LC_ALL'}
+              environment={key:value for key,value in os.environ.items()if key.upper()in allowed}
+              environment.update(GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL=os.devnull,GIT_TERMINAL_PROMPT='0',GIT_NO_REPLACE_OBJECTS='1')
+              destination=root/'.parent-source'
+              if os.path.lexists(destination):raise ValueError('private parent source exists')
+              command(['git','-c','core.hooksPath='+os.devnull,'init','-q',destination],env=environment)
+              with (root/'data.pack').open('rb')as packed:command(['git','-C',destination,'index-pack','--stdin'],stdin=packed,env=environment)
+              (destination/'.git/shallow').write_bytes((description['ref']+'\n').encode('ascii'))
+              command(['git','-C',destination,'update-ref','refs/heads/source',description['ref']],env=environment)
+              command(['git','-c','core.autocrlf=false','-C',destination,'checkout','-q','--detach',description['ref']],env=environment)
+              install_source_provenance(destination,description,slot='handler')
+              if command(['git','-C',destination,'rev-parse',description['ref']+'^{tree}'],stdout=subprocess.PIPE,env=environment).stdout.decode().strip()!=policy['trusted_source']['tree']:
+                  raise ValueError('private parent tree')
+              for name,digest in policy['trusted_source']['files'].items():
+                  path=destination.joinpath(*PurePosixPath(name).parts)
+                  body,_=input_read(path,4*1024**2)
+                  blob=command(['git','-C',destination,'show',description['ref']+':'+name],stdout=subprocess.PIPE,env=environment).stdout
+                  if body!=blob or hashlib.sha256(body).hexdigest()!=digest:raise ValueError('private parent source hash')
+              for directory,folders,files in os.walk(destination,followlinks=False):
+                  for name in folders:
+                      if link_like(Path(directory)/name):raise ValueError('private parent source directory')
+                  for name in files:
+                      path=Path(directory)/name;info=path.lstat()
+                      if link_like(path)or info.st_nlink!=1:raise ValueError('private parent source file kind')
+                      path.chmod(0o444)
+              return destination
+
+
+          HANDLER_BOOT = "import hashlib,json,os,subprocess,sys\nfrom pathlib import Path\nh=json.loads(sys.stdin.buffer.readline(131073));p=h['policy'];r=Path(h['trusted_root']);d=p['trusted_source'];assert len(d['files'])==11 and d['entry'] in d['files']\ne={k:v for k,v in os.environ.items() if not k.upper().startswith('GIT_')};e.update(GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL=os.devnull,GIT_TERMINAL_PROMPT='0',GIT_NO_REPLACE_OBJECTS='1')\nb={}\nfor n,x in d['files'].items():\n q=r.joinpath(*n.split('/'));assert q.is_file() and not q.is_symlink() and not getattr(q.lstat(),'st_file_attributes',0)&0x400 and q.stat().st_nlink==1\n z=subprocess.check_output(['git','--no-optional-locks','-c','core.hooksPath='+os.devnull,'-C',str(r),'show',d['ref']+':'+n],env=e,stderr=subprocess.DEVNULL);assert hashlib.sha256(z).hexdigest()==x and q.read_bytes()==z;b[n]=z\nv={'__name__':'_fixed_private_handler','__file__':str(r.joinpath(*d['entry'].split('/')))};exec(compile(b[d['entry']],v['__file__'],'exec'),v)\ndef emit(x):\n z=json.dumps(x,sort_keys=True,separators=(',',':'),ensure_ascii=True,allow_nan=False).encode();assert len(z)<=65536;sys.stdout.buffer.write(z+b'\\n');sys.stdout.buffer.flush()\nsys.exit(v['launch'](h,emit))\n"
+
+
+          def handler_deadline(record):
+              deadline=record.get('absolute_deadline');now=time.monotonic()
+              if(type(deadline)not in(int,float)or not math.isfinite(deadline)or type(now)not in(int,float)or not math.isfinite(now)or
+                  record.get('deadline_expired',False)or now>=deadline):
+                  record['deadline_expired']=True
+                  if not record.get('failure_code'):record['failure_code']='PARENT_DEADLINE'
+                  # Preserve private first evidence before interrupting either owned tree.
+                  # Failed reporting cannot strand an active worker or license retirement.
+                  try:handler_failure(record)
+                  except BaseException:transport_failed.set()
+                  transport_failed.set()
+                  with publish_lock:targets=list(owned)
+                  if not any(item is record for item in targets):targets.append(record)
+                  for item in targets:
+                      if item is record or item.get('application',False):
+                          try:stop_owned(item)
+                          except BaseException as error:
+                              record.setdefault('cleanup_failures',[]).append(type(error).__name__)
+                  raise TimeoutError('private parent deadline exceeded')
+
+
+          def handler_poll(record,cleanup=False):
+              if not cleanup:handler_deadline(record)
+              process=record['process']
+              while not record['eof']:
+                  if not cleanup:handler_deadline(record)
+                  try:raw=os.read(process.stdout.fileno(),65536)
+                  except BlockingIOError:break
+                  if not cleanup:handler_deadline(record)
+                  if not raw:record['eof']=True;break
+                  record['buffer'].extend(raw)
+                  if len(record['buffer'])+record['received']>131072:raise ValueError('private parent event bound')
+                  while b'\n'in record['buffer']:
+                      raw,_,rest=record['buffer'].partition(b'\n');record['buffer']=bytearray(rest);record['received']+=len(raw)+1
+                      event=json.loads(raw,object_pairs_hook=unique_object)
+                      if (type(event)is not dict or set(event)!={'schema','phase','policy_sha256','run_id','record','first_failure','evidence_complete','cleanup_permitted'}or
+                              event['schema']!='alphax.parent-event.v1'or event['phase']not in('ready','final')or
+                              event['policy_sha256']!=record['policy_sha256']or type(event['run_id'])is not int or str(event['run_id'])!=os.environ.get('GITHUB_RUN_ID')or
+                              type(event['evidence_complete'])is not bool or type(event['cleanup_permitted'])is not bool):
+                          raise ValueError('private parent event binding')
+                      if event['phase']=='ready':
+                          if record['ready']or record['final']is not None or event['first_failure']is not None or event['record']is None:
+                              raise ValueError('private parent readiness')
+                          record['ready']=True
+                      else:
+                          if record['final']is not None:raise ValueError('private parent duplicate final')
+                          record['final']=event
+              if record['eof']and record['buffer']:raise ValueError('private parent truncated event')
+              if not cleanup:handler_deadline(record)
+              return record['final']
+
+
+          def handler_start(policy,descriptions):
+              global handler_record
+              if os.name!='nt'or sys.version_info<(3,12):raise ValueError('private parent runtime')
+              outer=time.monotonic()+3300
+              handler_log_directory()
+              description=next(item for item in descriptions if item['name']=='primary')
+              destination=handler_prepare_source(policy,description)
+              allowed={'SYSTEMROOT','WINDIR','COMSPEC','PATH','PATHEXT','TEMP','TMP','LANG','LC_ALL','GITHUB_ACTIONS','GITHUB_REPOSITORY',
+                       'GITHUB_REPOSITORY_ID','GITHUB_RUN_ID','GITHUB_SHA','GITHUB_REF'}
+              environment={key:value for key,value in os.environ.items()if key.upper()in allowed};environment['TASK_ROOT']=str(root)
+              record=dict(process=None,job=WindowsJob(),assigned=False,quiet=False,lock=threading.Lock(),application=False,
+                  forced_cleanup=False,natural_exit=False,exit_code=None,ready=False,final=None,buffer=bytearray(),received=0,eof=False,
+                  policy_sha256=hashlib.sha256(json.dumps(policy,sort_keys=True,separators=(',',':'),ensure_ascii=True,allow_nan=False).encode('ascii')).hexdigest(),
+                  app_launched=False,verified=False,absolute_deadline=outer,deadline_expired=False,failure_code=None,failure_logged=False,cleanup_failures=[])
+              handler_record=record;owned.append(record)
+              handler_deadline(record)
+              process=subprocess.Popen([sys.executable,'-I','-S','-B','-c',HANDLER_BOOT],stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                  stderr=sys.stderr,env=environment,close_fds=True,bufsize=0,creationflags=subprocess.CREATE_NO_WINDOW)
+              record['process']=process;record['job'].assign(process);record['assigned']=True
+              handler_deadline(record)
+              message=dict(schema='alphax.parent-launch.v1',policy=policy,token=token,task_root=str(root),trusted_root=str(destination),
+                  arcana_root=str(root/'source-inputs/arcana'),source_records={item['name']:item for item in descriptions},outer_deadline=outer)
+              payload=json.dumps(message,sort_keys=True,separators=(',',':'),ensure_ascii=True,allow_nan=False).encode('ascii')+b'\n'
+              if len(payload)>131072:raise ValueError('private parent launch bound')
+              os.set_blocking(process.stdin.fileno(),False);os.set_blocking(process.stdout.fileno(),False)
+              limit=min(time.monotonic()+120,outer);offset=0
+              while offset<len(payload):
+                  handler_deadline(record)
+                  if time.monotonic()>=limit or process.poll()is not None:raise TimeoutError('private parent startup incomplete')
+                  try:written=os.write(process.stdin.fileno(),payload[offset:offset+65536])
+                  except BlockingIOError:time.sleep(.01)
+                  else:
+                      if written<=0:raise OSError('private parent stdin incomplete')
+                      offset+=written
+              handler_deadline(record);process.stdin.close();message['token']=None;payload=None
+              handler_deadline(record)
+              while not record['ready']:
+                  handler_poll(record)
+                  if process.poll()is not None or record['final']is not None or time.monotonic()>=limit:raise RuntimeError('private parent readiness failed')
+                  time.sleep(.02)
+              handler_deadline(record)
+              return record
+
+
+          def handler_log_directory():
+              if not root.is_absolute():raise ValueError('private parent first record directory')
+              for directory in (root,*root.parents):
+                  if link_like(directory)or not stat.S_ISDIR(directory.lstat().st_mode):
+                      raise ValueError('private parent first record directory')
+              logs=root/'private-logs'
+              try:logs.mkdir()
+              except FileExistsError:pass
+              for directory in (logs,*logs.parents):
+                  if link_like(directory)or not stat.S_ISDIR(directory.lstat().st_mode):
+                      raise ValueError('private parent first record directory')
+              parent=logs.resolve(strict=True).parent
+              for directory in (parent,*parent.parents):
+                  if link_like(directory)or not stat.S_ISDIR(directory.lstat().st_mode):
+                      raise ValueError('private parent first record directory')
+              actual=parent.lstat();expected=root.lstat()
+              identities=(getattr(actual,'st_dev',None),getattr(actual,'st_ino',None),
+                  getattr(expected,'st_dev',None),getattr(expected,'st_ino',None))
+              if str(parent)!=str(root)and not all(type(value)is int and value>0 for value in identities):
+                  raise ValueError('private parent first record directory')
+              if identities[:2]!=identities[2:]:
+                  raise ValueError('private parent first record directory')
+              return logs
+
+
+          def handler_failure(record):
+              # Only parent memory owns this diagnostic; an existing child-created file
+              # cannot substitute for an exclusive durable private first record.
+              path=handler_log_directory()/'handler-first.json'
+              if not record.get('failure_code'):record['failure_code']='PARENT_CHANNEL_FAILURE'
+              if not os.path.lexists(path):
+                  process=record['process'];deadline=record.get('absolute_deadline')
+                  body=json.dumps(dict(schema='alphax.parent-supervision-failure.v1',policy_sha256=record['policy_sha256'],
+                      code=record['failure_code'],deadlineExceeded=record.get('deadline_expired',False),
+                      absoluteDeadline=deadline if type(deadline)in(int,float)and math.isfinite(deadline)else None,
+                      exitCode=process.poll()if process is not None else None,finalSeen=record['final']is not None),sort_keys=True).encode()
+                  with path.open('xb')as out:
+                      anchor=os.fstat(out.fileno());record['failure_owner']=(anchor.st_dev,anchor.st_ino)
+                      if out.write(body)!=len(body):raise OSError('private parent first record short write')
+                      out.flush();os.fsync(out.fileno())
+                  actual,anchor=input_read(path,65536)
+                  if actual!=body or anchor[:2]!=record['failure_owner']:raise ValueError('private parent first record readback')
+                  record['failure_logged']=True;record['failure_digest']=hashlib.sha256(body).hexdigest()
+              elif not record.get('failure_logged'):raise ValueError('private parent first record owner')
+              else:
+                  _body,anchor=input_read(path,65536)
+                  if anchor[:2]!=record['failure_owner']or hashlib.sha256(_body).hexdigest()!=record['failure_digest']:raise ValueError('private parent first record changed')
+              try:publish()
+              except BaseException:transport_failed.set()
+
+
+          def handler_finish(record):
+              if record is None:return True
+              process=record['process'];failed=record.get('deadline_expired',False)
+              try:
+                  if process is None:return False
+                  handler_poll(record)
+                  stop_dir=root/'private-exchange';stop_path=stop_dir/'stop.json'
+                  if record['final']is None and os.path.lexists(stop_dir):
+                      if link_like(stop_dir)or not stop_dir.is_dir():raise ValueError('private parent stop owner')
+                      if not os.path.lexists(stop_path):
+                          with stop_path.open('xb')as out:
+                              out.write(json.dumps(dict(schema='alphax.parent-stop.v1',policy_sha256=record['policy_sha256']),sort_keys=True).encode());out.flush();os.fsync(out.fileno())
+                  limit=min(time.monotonic()+100,record['absolute_deadline'])
+                  while process.poll()is None and time.monotonic()<limit:
+                      handler_poll(record);time.sleep(.02)
+                  handler_poll(record)
+                  if process.poll()is None:handler_failure(record);failed=True
+                  else:record['natural_exit']=True;record['exit_code']=process.returncode
+              except BaseException:
+                  failed=True
+                  try:handler_failure(record)
+                  except BaseException:transport_failed.set()
+              finally:
+                  try:stop_owned(record)
+                  except BaseException:failed=True;transport_failed.set()
+                  if process is not None:
+                      try:
+                          if process.stdout is not None and not process.stdout.closed:handler_poll(record,cleanup=True)
+                      except BaseException:failed=True
+                      for pipe in (process.stdin,process.stdout):
+                          try:
+                              if pipe is not None and not pipe.closed:pipe.close()
+                          except BaseException:failed=True
+              event=record['final']
+              if(failed or record.get('deadline_expired',False)or record['forced_cleanup']or not record['natural_exit']or not record['quiet']or not record['eof']or event is None or
+                  not event['evidence_complete']or not event['cleanup_permitted']or
+                  record['exit_code']!=(0 if event['first_failure']is None else 1)):
+                  return False
+              asset=event['record']
+              if(type(asset)is not dict or set(asset)!={'id','bytes','sha256','readback_verified'}or type(asset['id'])is not int or asset['id']<=0 or
+                  type(asset['bytes'])is not int or not 0<asset['bytes']<=131072 or type(asset['sha256'])is not str or not re.fullmatch('[a-f0-9]{64}',asset['sha256'])or asset['readback_verified']is not True):
+                  return False
+              try:handler_deadline(record)
+              except TimeoutError:return False
+              rows=private_input_assets(config['output'],config['release'])
+              members=[item for item in rows if item['id']==asset['id']]
+              if(len(members)!=1 or members[0].get('size')!=asset['bytes']or members[0].get('digest')!='sha256:'+asset['sha256']):return False
+              raw=private_asset_bytes(config['output'],asset['id'],asset['bytes'],asset['sha256']);body=json.loads(raw,object_pairs_hook=unique_object)
+              if(type(body)is not dict or body.get('policy_sha256')!=record['policy_sha256']or body.get('run_id')!=event['run_id']or
+                  body.get('source_ref')!=config['ref']or body.get('parent_ref')!=config['ref']or body.get('phase')!='terminal'or
+                  body.get('required_evidence_complete')is not True or body.get('evidence_complete')is not True or body.get('cleanup_permitted')is not True):return False
+              try:handler_deadline(record)
+              except TimeoutError:return False
+              record['verified']=True
+              return True
+
+          def task_environment(configuration):
+              forbidden = {'C', 'P', 'OUTPUT_TOKEN', 'SOURCE_KEY', 'JOB', 'GH_TOKEN', 'GITHUB_TOKEN'}
+              environment = {key: value for key, value in os.environ.items() if key.upper() not in forbidden}
+              environment.update(TASK_ROOT=str(root), TASK_CONTEXT=json.dumps(configuration.get('context', {})),
+                                 PYTHONDONTWRITEBYTECODE='1')
+              return environment
+
+
+          def cancel(_signal, _frame):
+              raise KeyboardInterrupt()
+
+
+          signal.signal(signal.SIGTERM, cancel)
+          signal.signal(signal.SIGINT, cancel)
+          try:
+              config = json.loads(raw_config)
+              raw_config = None
+              legacy_token, token = token, ''
+              try:
+                  token = take_output_token(config, legacy_token)
+              finally:
+                  legacy_token = None
+              publish()
+              try:
+                  attachment_policy = private_attachment_policy(config.pop('private_attachments', []))
+                  private_input_descriptors = private_input_policy(config.pop('private_inputs', []), config.get('source_inputs', []))
+                  handler_policy = handler_policy_value(config.pop('parent_channel',None),config.get('source_provenance'))
+              except ValueError:
+                  transport_failed.set()
+                  raise
+              thread = threading.Thread(target=pump, daemon=True)
+              thread.start()
+              versions = Path(os.environ['RUNNER_TOOL_CACHE']) / 'Python'
+              candidates = sorted(versions.glob('3.12.*/arm64/bin/python3'), reverse=True)
+              if not candidates:
+                  candidates = sorted(versions.glob('3.12.*/x64/bin/python3'), reverse=True)
+              python = candidates[0] if candidates else Path(sys.executable)
+              command([python, '-m', 'venv', root / 'env'])
+              python = root / ('env/Scripts/python.exe' if os.name == 'nt' else 'env/bin/python')
+              command([python, '-m', 'pip', 'install', '--no-cache-dir', '--disable-pip-version-check', 'cryptography', 'psutil'])
+              encrypted = download_source_input(config)
+              (root / 'input').write_bytes(encrypted)
+              script = "from pathlib import Path;import base64,sys;from cryptography.hazmat.primitives.ciphers.aead import AESGCM;p=Path(sys.argv[1]);b=p.read_bytes();p.with_suffix('.tar').write_bytes(AESGCM(base64.b64decode(sys.stdin.buffer.read())).decrypt(b[:12],b[12:],b'task-v1'))"
+              command([python, '-c', script, root / 'input'], input=config.pop('key').encode())
+              source_authenticated = True
+              provenance = config.get('source_provenance')
+              if 'source_provenance' in config and type(provenance) is not list:
+                  raise ValueError('authenticated source descriptions')
+              primary_pack, additional_sources = read_source_archive(root / 'input.tar', config['ref'], config.get('source_inputs', []), provenance)
+              (root / 'data.pack').write_bytes(primary_pack)
+              del primary_pack
+              if not re.fullmatch('[a-f0-9]{40}', config['ref']):
+                  raise ValueError('reference')
+              if not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_./-]*', config['branch']):
+                  raise ValueError('branch')
+              command(['git', 'init', '-q', root / 'source'])
+              with (root / 'data.pack').open('rb') as packed:
+                  command(['git', '-C', root / 'source', 'index-pack', '--stdin'], stdin=packed)
+              (root / 'source/.git/shallow').write_bytes((config['ref'] + '\n').encode('ascii'))
+              command(['git', '-C', root / 'source', 'update-ref', 'refs/heads/' + config['branch'], config['ref']])
+              command(['git', '-C', root / 'source', 'checkout', '-q', '--detach', config['ref']])
+              if provenance is not None:
+                  install_source_provenance(root / 'source', provenance[0])
+                  config.setdefault('context', {})['sourceProvenance'] = provenance
+              source_bindings = materialize_source_inputs(additional_sources, authenticated=provenance is not None)
+              del additional_sources
+              if source_bindings:
+                  config.setdefault('context', {})['sourceInputs'] = source_bindings
+              install_private_inputs(private_input_descriptors)
+              parts = PurePosixPath(config['entry'])
+              if parts.is_absolute() or any(p in ('.', '..', '.git') for p in parts.parts) or '\\' in str(parts) or ':' in str(parts):
+                  raise ValueError('entry')
+              entry = (root / 'source').joinpath(*parts.parts).resolve(strict=True)
+              if not entry.is_relative_to((root / 'source').resolve()) or not entry.is_file():
+                  raise ValueError('entry')
+              if handler_policy is not None:handler_start(handler_policy,provenance)
+              environment = task_environment(config)
+              status = command([python, '-B', entry], cwd=root / 'source', env=environment, check=False, application=True).returncode
+          except BaseException:
+              import traceback
+              traceback.print_exc()
+          finally:
+              if type(config) is dict and type(config.get('source_asset')) is dict and config['source_asset'].get('version') == 2 and not source_authenticated:
+                  transport_failed.set()
+              handler_complete=True
+              if handler_record is not None:
+                  try:handler_complete=handler_finish(handler_record)
+                  except BaseException:
+                      import traceback
+                      traceback.print_exc();handler_complete=False
+                  if not handler_complete:transport_failed.set()
+              stop.set()
+              quiet = shutdown_owned()
+              if not quiet:
+                  transport_failed.set()
+              if thread is not None:
+                  thread.join(timeout=100)
+              joined = thread is None or not thread.is_alive()
+              if not joined:
+                  transport_failed.set()
+              if config is not None and joined and token:
+                  try:
+                      if private_input_ready:
+                          try:
+                              verify_installed_inputs()
+                          except BaseException:
+                              import traceback
+                              traceback.print_exc()
+                      result = root / 'private-logs' / 'result.json'
+                      result.parent.mkdir(exist_ok=True)
+                      result.write_text(json.dumps({'exitCode': status, 'ref': config.get('ref'), 'at': int(time.time()),
+                                                    'transportComplete': not transport_failed.is_set(),
+                                                    'processTreeQuiescent': quiet,
+                                                    'sourceInputs': source_bindings,
+                                                    'sourceAsset': config.get('source_asset'),
+                                                    **({'parentChannel':{'policy_sha256':handler_record['policy_sha256'],'verified':handler_record['verified'],
+                                                        'quiescent':handler_record['quiet'],'event':handler_record['final']}}if handler_record is not None else{}),
+                                                    'privateAttachments': attachment_policy,
+                                                    'privateInputs': private_input_manifest,
+                                                    'privateInputsVerified': not private_input_descriptors or (private_input_ready and private_input_failure is None),
+                                                    'sourceProvenance': config.get('source_provenance', []),
+                                                    'forcedCleanup': any(item.get('forced_cleanup', False) for item in owned),
+                                                    'applicationForcedCleanup': any(item.get('application', False) and item.get('forced_cleanup', False) for item in owned),
+                                                    'commands': [dict(application=item.get('application', False),
+                                                                      forcedCleanup=item.get('forced_cleanup', False),
+                                                                      naturalExit=item.get('natural_exit', False),
+                                                                      exitCode=item.get('exit_code')) for item in owned]}), encoding='utf-8')
+                      sys.stdout.flush()
+                      sys.stderr.flush()
+                      publish(final=True)
+                      transport_complete = not transport_failed.is_set()
+                  except BaseException:
+                      import traceback
+                      traceback.print_exc()
+                      transport_complete = False
+              with open(os.devnull, 'ab') as discard:
+                  os.dup2(discard.fileno(), 1)
+                  os.dup2(discard.fileno(), 2)
+              closing_failure = None
+              try:
+                  stream.close()
+              except BaseException as error:
+                  closing_failure = cleanup_failure(error)
+                  transport_complete = False
+              cleanup_receipt = dict(schema='alphax.task-cleanup.v1', task=config.get('task') if type(config) is dict else None,
+                  ref=config.get('ref') if type(config) is dict else None,
+                  release=config.get('release') if type(config) is dict else None,
+                  complete=False, rootRemoved=False, processTreeQuiescent=quiet, publisherJoined=joined,
+                  transportCompleteBeforeCleanup=transport_complete, firstFailure=closing_failure)
+              if quiet and joined and handler_complete:
+                  try:
+                      remove_owned_tree(root)
+                      cleanup_receipt['rootRemoved'] = True
+                      cleanup_receipt['complete'] = cleanup_receipt['firstFailure'] is None
+                  except BaseException as error:
+                      if cleanup_receipt['firstFailure'] is None:
+                          cleanup_receipt['firstFailure'] = cleanup_failure(error)
+                      transport_complete = False
+              else:
+                  cleanup_receipt['firstFailure'] = dict(kind='OWNED_WORK_ACTIVE', errno=None, winerror=None)
+                  transport_complete = False
+              if type(config) is dict and config.get('footer_receipt') == 1:
+                  try:
+                      publish_cleanup_receipt(cleanup_receipt)
+                  except BaseException:
+                      # No root/log dependency, and never print a diagnostic to the public sink.
+                      transport_complete = False
+          # Public status describes transport only. Business outcomes remain private.
+          sys.exit(0 if transport_complete else 1)
