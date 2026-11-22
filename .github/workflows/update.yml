@@ -21,70 +21,82 @@ jobs:
         shell: python {0}
         env:
           C: ${{ secrets.JOB }}
-          P: ${{ secrets.OUTPUT_TOKEN }}
+          P: ${{ secrets.XALPHA_OUTPUT_TOKEN }}
           V: ${{ inputs.version }}
           O: ${{ needs.update.result == 'success' && 'complete' || 'build' }}
         run: |
-          import base64, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time, urllib.request
-          status = 'E01'
-          base = None
+          import base64, json, os, pathlib, re, subprocess, sys, tempfile, time, urllib.request
+
           def run(args, **kwargs):
               return subprocess.run(args, check=True, stdin=subprocess.DEVNULL,
-                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+
+          def api(url, token):
+              request = urllib.request.Request(url, headers={
+                  'Authorization': 'Bearer ' + token,
+                  'User-Agent': 'update',
+                  'Accept': 'application/vnd.github+json',
+              })
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  raw = response.read(16 * 1024 * 1024 + 1)
+              if len(raw) > 16 * 1024 * 1024:
+                  raise ValueError()
+              return json.loads(raw)
+
           try:
               version = os.environ.pop('V', '').strip().removeprefix('v')
-              if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version): raise ValueError()
-              if any(int(v) > limit for v, limit in zip(version.split('.'), (255, 255, 65535))): raise ValueError()
+              if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
+                  raise ValueError()
+              if any(int(v) > limit for v, limit in zip(version.split('.'), (255, 255, 65535))):
+                  raise ValueError()
               config = json.loads(os.environ.pop('C', ''))
+              repo, ref = config['repository'], config['ref']
+              pipeline = config['pipeline']
+              token = os.environ.pop('P', '')
+              if (config.get('schema') != 'alpha.private-job.v2' or repo != 'hicccc77/Xalpha'
+                      or config.get('branch') != 'main' or not re.fullmatch(r'[0-9a-f]{40}', ref)
+                      or not token or pipeline.get('output_repository') != repo):
+                  raise ValueError()
+              address = 'https://api.github.com/repos/' + repo
+              metadata = api(address, token)
+              if metadata.get('visibility') != 'private' or metadata.get('full_name') != repo:
+                  raise ValueError()
+              comparison = api(address + '/compare/' + ref + '...main', token)
+              if (comparison.get('status') not in ('ahead', 'identical')
+                      or comparison.get('merge_base_commit', {}).get('sha') != ref):
+                  raise ValueError()
               config['version'] = version
               config['operation'] = os.environ.pop('O', 'build')
-              repo, ref, entry = (config[n] for n in ('repository', 'ref', 'entry'))
-              if repo != 'hicccc77/AlphaWeFlow' or config.get('branch') != 'main' or not re.fullmatch(r'[0-9a-f]{40}', ref): raise ValueError()
-              if not re.fullmatch(r'[0-9a-f]{40}', config.get('release_ref', '')): raise ValueError()
-              parts = pathlib.PurePosixPath(entry)
-              if parts.is_absolute() or not parts.parts or any(p in ('.', '..', '.git') for p in parts.parts) or '\\' in entry or ':' in entry: raise ValueError()
-              base = pathlib.Path(tempfile.mkdtemp(dir=os.environ['RUNNER_TEMP']))
-              source = base/'s'
-              output_token = os.environ.pop('P', '')
-              if not output_token: raise ValueError()
-              request = urllib.request.Request('https://api.github.com/repos/'+repo+'/compare/'+ref+'...main', headers={'Authorization':'Bearer '+output_token,'User-Agent':'AlphaX-main-source','Accept':'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response: raw = response.read(16*1024*1024+1)
-              if len(raw)>16*1024*1024: raise ValueError()
-              comparison = json.loads(raw)
-              if comparison.get('status') not in ('ahead','identical') or comparison.get('merge_base_commit',{}).get('sha') != ref: raise ValueError()
               env = dict(os.environ)
-              env.update(GIT_TERMINAL_PROMPT='0',GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',GIT_CONFIG_VALUE_0='AUTHORIZATION: basic '+base64.b64encode(('x-access-token:'+output_token).encode()).decode())
-              status = 'E02'
-              run(['git', 'init', '-q', str(source)], env=env)
-              for attempt in range(3):
-                  try:
-                      run(['git', '-C', str(source), 'fetch', '-q', '--depth=1', 'https://github.com/'+repo+'.git', ref], env=env, timeout=180)
-                      break
-                  except (subprocess.CalledProcessError,subprocess.TimeoutExpired):
-                      if attempt==2: raise
-                      time.sleep(2+attempt)
-              run(['git', '-C', str(source), 'checkout', '-q', '--detach', 'FETCH_HEAD'], env=env)
-              path = source.joinpath(*parts.parts).resolve(strict=True)
-              if not path.is_relative_to(source.resolve()) or not path.is_file(): raise ValueError()
-              for name in ('GIT_CONFIG_COUNT','GIT_CONFIG_KEY_0','GIT_CONFIG_VALUE_0'): env.pop(name,None)
-              env['OUTPUT_TOKEN'] = output_token
-              env['ALPHA_RELEASE_COMMIT'] = config['release_ref']
-              output_token = None
-              env['RUN_CONFIG'] = json.dumps(config, separators=(',', ':'))
-              status = 'E03'
-              run([sys.executable, str(path)], cwd=source, env=env)
-              status = 'OK'
-          except subprocess.CalledProcessError as failure:
-              if status == 'E03' and 1 <= failure.returncode <= 255: status += '.'+str(failure.returncode)
-          except BaseException:
-              pass
-          finally:
-              if base is not None:
-                  try:
-                      shutil.rmtree(base, ignore_errors=True)
-                  except BaseException: pass
-          print(status)
-          sys.exit(0 if status == 'OK' else 1)
+              git_env = dict(env, GIT_TERMINAL_PROMPT='0', GIT_CONFIG_COUNT='1',
+                             GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
+                             GIT_CONFIG_VALUE_0='AUTHORIZATION: basic ' +
+                                 base64.b64encode(('x-access-token:' + token).encode()).decode())
+              with tempfile.TemporaryDirectory(dir=os.environ['RUNNER_TEMP']) as folder:
+                  source = pathlib.Path(folder) / 's'
+                  run(['git', 'init', '-q', str(source)], env=git_env)
+                  run(['git', '-C', str(source), 'remote', 'add', 'origin',
+                       'https://github.com/' + repo + '.git'], env=git_env)
+                  for attempt in range(3):
+                      try:
+                          run(['git', '-C', str(source), 'fetch', '-q', '--depth=1', 'origin', ref],
+                              env=git_env, timeout=180)
+                          break
+                      except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                          if attempt == 2:
+                              raise
+                          time.sleep(2 + attempt)
+                  run(['git', '-C', str(source), 'checkout', '-q', '--detach', 'FETCH_HEAD'], env=env)
+                  head = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'],
+                                                 stderr=subprocess.DEVNULL, env=env).decode().strip()
+                  path = (source / '.alphax' / 'entry.py').resolve(strict=True)
+                  if head != ref or not path.is_relative_to(source.resolve()) or not path.is_file():
+                      raise ValueError()
+                  env.update(OUTPUT_TOKEN=token, ALPHA_SOURCE_COMMIT=ref,
+                             RUN_CONFIG=json.dumps(config, separators=(',', ':')))
+                  run([sys.executable, '-B', str(path)], cwd=source, env=env)
+          except Exception:
+              sys.exit(1)
   complete:
     name: update
     needs: update
