@@ -1,0 +1,68 @@
+name: archive
+on:
+  workflow_run:
+    workflows: [update]
+    types: [completed]
+    branches: [main]
+permissions:
+  actions: write
+concurrency:
+  group: archive-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+jobs:
+  update:
+    name: update
+    if: >-
+      github.repository == 'hicccc77/AlphaX' &&
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: update
+        shell: python {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          XALPHA_OUTPUT_TOKEN: ${{ secrets.XALPHA_OUTPUT_TOKEN }}
+          ARCHIVE_REF: ${{ secrets.ARCHIVE_REF }}
+          SOURCE_BRANCH: main
+        run: |
+          import base64, hashlib, json, os, pathlib, re, subprocess, sys, tempfile
+
+          try:
+              env = dict(os.environ)
+              token = env.pop('XALPHA_OUTPUT_TOKEN')
+              ref = env.pop('ARCHIVE_REF')
+              branch = env.pop('SOURCE_BRANCH')
+              if not token or not re.fullmatch('[0-9a-f]{40}', ref):
+                  raise ValueError()
+              private_env = dict(env, GH_TOKEN=token, GH_PROMPT_DISABLED='1')
+
+              def read(suffix):
+                  raw = subprocess.check_output(['gh', 'api', 'repos/hicccc77/Xalpha' + suffix],
+                                                env=private_env, stderr=subprocess.DEVNULL)
+                  return json.loads(raw)
+
+              repo = read('')
+              if repo.get('visibility') != 'private' or repo.get('full_name') != 'hicccc77/Xalpha':
+                  raise ValueError()
+              compared = read('/compare/' + ref + '...main')
+              if (compared.get('status') not in ('ahead', 'identical')
+                      or compared.get('merge_base_commit', {}).get('sha') != ref):
+                  raise ValueError()
+              row = read('/contents/.alphax/archive_logs.py?ref=' + ref)
+              if row.get('type') != 'file' or not 0 < row.get('size', 0) <= 65536:
+                  raise ValueError()
+              raw = base64.b64decode(row['content'])
+              digest = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+              if len(raw) != row['size'] or digest != row.get('sha'):
+                  raise ValueError()
+              with tempfile.TemporaryDirectory(dir=os.environ['RUNNER_TEMP']) as folder:
+                  worker = pathlib.Path(folder) / 'worker.py'
+                  worker.write_bytes(raw)
+                  subprocess.run([sys.executable, '-B', str(worker), '--branch', branch],
+                                 env=dict(env, XALPHA_OUTPUT_TOKEN=token), check=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+          except Exception:
+              sys.exit(1)
